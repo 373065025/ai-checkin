@@ -15,6 +15,8 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import zlib from 'node:zlib';
+import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseManifest } from './lib/tar-read.js';
@@ -43,17 +45,25 @@ const API = 'https://api.github.com';
 function resolveToken() {
   if (process.env.GH_TOKEN) return { token: process.env.GH_TOKEN.trim(), from: 'GH_TOKEN' };
   if (process.env.GITHUB_TOKEN) return { token: process.env.GITHUB_TOKEN.trim(), from: 'GITHUB_TOKEN' };
-  const git = process.env.GIT_BIN || 'git';
-  try {
-    const out = execFileSync(git, ['credential', 'fill'], {
-      input: 'protocol=https\nhost=github.com\n\n',
-      encoding: 'utf8',
-      env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
-      stdio: ['pipe', 'pipe', 'ignore'],
-    });
-    const pm = out.match(/^password=(.*)$/m);
-    if (pm && pm[1].trim()) return { token: pm[1].trim(), from: 'git credential fill' };
-  } catch { /* ignore */ }
+  // 本机 Bash/PowerShell 的 PATH 里常常没有 git，逐条尝试候选路径
+  const candidates = [
+    process.env.GIT_BIN,
+    'git',
+    'C:/Users/AGG/.workbuddy/binaries/PortableGit/versions/1.2.0/cmd/git.exe',
+    'C:/Program Files/Git/cmd/git.exe',
+  ].filter(Boolean);
+  for (const git of candidates) {
+    try {
+      const out = execFileSync(git, ['credential', 'fill'], {
+        input: 'protocol=https\nhost=github.com\n\n',
+        encoding: 'utf8',
+        env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+        stdio: ['pipe', 'pipe', 'ignore'],
+      });
+      const pm = out.match(/^password=(.*)$/m);
+      if (pm && pm[1].trim()) return { token: pm[1].trim(), from: 'git credential fill' };
+    } catch { /* 换下一个候选 */ }
+  }
   return null;
 }
 
@@ -71,20 +81,43 @@ const H = {
   'X-GitHub-Api-Version': '2022-11-28',
 };
 
-async function api(method, endpoint, body, extraHeaders = {}) {
-  const r = await fetch(API + endpoint, {
-    method,
-    headers: { ...H, ...extraHeaders },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  const text = await r.text();
-  let data;
-  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-  if (!r.ok) {
-    const msg = (data && data.message) || text || r.statusText;
-    throw new Error(`${method} ${endpoint} → ${r.status} ${msg}`);
+// 网络抖动（GFW / TLS 重置）常见，对幂等请求做有限重试
+const RETRYABLE = /fetch failed|ECONNRESET|ETIMEDOUT|EAI_AGAIN|EPIPE|socket hang up|network/i;
+const sleep = (ms) => new Promise((s) => setTimeout(s, ms));
+
+async function withRetry(label, fn, tries = 4) {
+  let last;
+  for (let i = 1; i <= tries; i++) {
+    try { return await fn(); } catch (e) {
+      last = e;
+      const retryable = RETRYABLE.test(e.message) || RETRYABLE.test((e.cause && e.cause.code) || '');
+      if (i === tries || !retryable) break;
+      console.log(`  ! ${label} 第 ${i} 次失败（${e.message.slice(0, 80)}），${i * 1200}ms 后重试`);
+      await sleep(i * 1200);
+    }
   }
-  return data;
+  throw last;
+}
+
+async function api(method, endpoint, body, extraHeaders = {}) {
+  // 仅对幂等语义（GET/DELETE/PATCH）自动重试；POST 交给调用方按需重试
+  const idempotent = method !== 'POST';
+  const run = async () => {
+    const r = await fetch(API + endpoint, {
+      method,
+      headers: { ...H, ...extraHeaders },
+      body: body === undefined ? undefined : JSON.stringify(body),
+    });
+    const text = await r.text();
+    let data;
+    try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+    if (!r.ok) {
+      const msg = (data && data.message) || text || r.statusText;
+      throw new Error(`${method} ${endpoint} → ${r.status} ${msg}`);
+    }
+    return data;
+  };
+  return idempotent ? withRetry(`${method} ${endpoint}`, run) : run();
 }
 
 async function listReleases() {
@@ -120,17 +153,39 @@ async function uploadAsset(release, file) {
   const buf = fs.readFileSync(file);
   const ct = /\.fpk$|\.tgz$/i.test(name) ? 'application/gzip' : 'application/octet-stream';
   const base = `https://uploads.github.com/repos/${owner}/${repo}/releases/${release.id}/assets`;
-  const r = await fetch(`${base}?name=${encodeURIComponent(name)}`, {
-    method: 'POST',
-    headers: { ...H, 'Content-Type': ct, 'Content-Length': String(buf.length) },
-    body: buf,
+  const data = await withRetry(`上传 ${name}`, async () => {
+    const r = await fetch(`${base}?name=${encodeURIComponent(name)}`, {
+      method: 'POST',
+      headers: { ...H, 'Content-Type': ct, 'Content-Length': String(buf.length) },
+      body: buf,
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`上传 ${name} 失败 → ${r.status} ${t.slice(0, 300)}`);
+    }
+    return r.json();
   });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`上传 ${name} 失败 → ${r.status} ${t.slice(0, 300)}`);
-  }
-  const data = await r.json();
   console.log(`  ✓ 已上传 ${name}  (${(data.size / 1024).toFixed(1)} KB)`);
+  return data;
+}
+
+// 同名附件去重：只保留最新一个（上传重试可能产生重复）
+async function dedupeAssets(releaseId) {
+  const assets = await api('GET', `/repos/${owner}/${repo}/releases/${releaseId}/assets?per_page=100`);
+  const byName = new Map();
+  for (const a of assets) {
+    const list = byName.get(a.name) || [];
+    list.push(a);
+    byName.set(a.name, list);
+  }
+  for (const [name, list] of byName) {
+    if (list.length < 2) continue;
+    list.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+    for (const dup of list.slice(1)) {
+      await api('DELETE', `/repos/${owner}/${repo}/releases/assets/${dup.id}`);
+      console.log(`  · 去重：删除多余附件 ${name} (id ${dup.id})`);
+    }
+  }
 }
 
 // ---------- 主流程 ----------
@@ -214,5 +269,78 @@ async function publish() {
   console.log(`  Release: ${rel.html_url}`);
 
   console.log('· 上传附件');
-  for (const f of assetFiles()) await uploadAsset(rel, f);
+  const files = assetFiles();
+  for (const f of files) await uploadAsset(rel, f);
+
+  await dedupeAssets(rel.id);
+  await verifyAssets(rel.id, files);
+
+  console.log(`\n✓ 发布完成：${rel.html_url}`);
+}
+
+// 校验远端附件与本地一致。
+// 先比 sha256；不一致时**下载回来做内容比对**——tag 推送会触发 CI 重建并覆盖附件，
+// 两份包可能只差 tar 头里的 mtime（内容完全相同），此时不应报错，而应说明清楚。
+async function verifyAssets(releaseId, files) {
+  const assets = await api('GET', `/repos/${owner}/${repo}/releases/${releaseId}/assets?per_page=100`);
+  const local = new Map(files.map((f) => {
+    const sha256 = crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');
+    return [path.basename(f), { path: f, sha256 }];
+  }));
+  console.log('· 校验远端附件');
+  let bad = 0;
+  for (const [name, { path: p, sha256 }] of local) {
+    const a = assets.find((x) => x.name === name);
+    if (!a) { console.log(`  ✗ 远端缺少 ${name}`); bad++; continue; }
+    const remote = (a.digest || '').replace(/^sha256:/, '');
+    if (remote && remote === sha256) { console.log(`  ✓ ${name} sha256 完全一致`); continue; }
+    if (!remote) { console.log(`  ? ${name} 远端无 digest，改为下载内容比对`); }
+
+    const verdict = await compareContent(a.id, p);
+    if (verdict === 'same-tar') {
+      console.log(`  ~ ${name} sha256 不同，但解包内容一致（仅 tar 头时间戳差异，通常来自 CI 重建覆盖）`);
+    } else if (verdict === 'same') {
+      console.log(`  ✓ ${name} 下载比对完全一致（远端 digest 未更新，可忽略）`);
+    } else {
+      console.log(`  ✗ ${name} 内容不一致（${verdict}），需重新 --publish`);
+      bad++;
+    }
+  }
+  if (bad) {
+    console.error(`\n✗ ${bad} 个附件校验失败，请重新执行 node tools/release.js --publish`);
+    process.exitCode = 1;
+  }
+}
+
+/** 下载远端资产，与本地文件比对解压后的 tar（忽略 mtime 与校验和字段） */
+async function compareContent(assetId, localPath) {
+  const r = await fetch(`${API}/repos/${owner}/${repo}/releases/assets/${assetId}`, {
+    headers: { ...H, Accept: 'application/octet-stream' },
+  });
+  if (!r.ok) return `下载失败 ${r.status}`;
+  const remote = Buffer.from(await r.arrayBuffer());
+  const localBuf = fs.readFileSync(localPath);
+  if (remote.equals(localBuf)) return 'same';
+  const a = maybeGunzip(localBuf);
+  const b = maybeGunzip(remote);
+  if (a.length !== b.length) return `解压长度不同 ${a.length} vs ${b.length}`;
+  return maskTarMeta(a).equals(maskTarMeta(b)) ? 'same-tar' : '字节内容不同';
+}
+
+function maybeGunzip(buf) {
+  if (buf.length > 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
+    try { return zlib.gunzipSync(buf); } catch { /* 落到原样比较 */ }
+  }
+  return buf;
+}
+
+/** 把每个 tar 头块的 mtime(136..147) 与 checksum(148..155) 清零，用于忽略时间戳比较 */
+function maskTarMeta(tar) {
+  const out = Buffer.from(tar);
+  for (let off = 0; off + 512 <= out.length; off += 512) {
+    const isZero = out.subarray(off, off + 512).every((x) => x === 0);
+    if (isZero) continue;
+    out.fill(0, off + 136, off + 156);
+  }
+  return out;
 }

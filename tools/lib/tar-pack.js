@@ -1,12 +1,21 @@
 /**
  * 零依赖 tar / gzip 打包工具（构建用，Windows 也能跑）
  * 只依赖 node 内置模块；长路径（>100 字节）自动改用 GNU 风格的 PAX 扩展头。
+ *
+ * 可复现构建：所有条目的 mtime 固定为 SOURCE_DATE_EPOCH（默认 0），
+ * 不再取源文件 mtime。这样本机构建与 GitHub Actions 构建产出的字节完全一致
+ * —— 否则 tag 触发 CI 重建后会「覆盖」本机上测试过的包，两份包的 tar 头时间戳
+ * 不同、sha256 对不上，让人误以为上传损坏（v1.0.5 / v1.0.6 各踩过一次）。
  */
 import { readFile } from 'node:fs/promises';
 import { readdirSync, statSync } from 'node:fs';
 import { createGzip } from 'node:zlib';
 import { Readable } from 'node:stream';
 import path from 'node:path';
+
+const SOURCE_DATE_EPOCH = Number.isFinite(Number(process.env.SOURCE_DATE_EPOCH))
+  ? Number(process.env.SOURCE_DATE_EPOCH)
+  : 0;
 
 function octal(n, len) {
   return n.toString(8).padStart(len - 1, '0') + '\0';
@@ -63,7 +72,7 @@ export async function packTar(entries) {
     const mode = e.mode != null ? e.mode : (isDir ? 0o755 : 0o644);
     const data = isDir ? null : (e.data != null ? e.data : await readFile(e.abs));
     const size = isDir ? 0 : data.length;
-    const mtime = Math.floor((e.stat ? e.stat.mtimeMs : Date.now()) / 1000);
+    const mtime = SOURCE_DATE_EPOCH; // 固定，见文件头「可复现构建」说明
 
     if (Buffer.byteLength(e.name, 'utf-8') > 100) {
       const record = paxRecord('path', e.name);
