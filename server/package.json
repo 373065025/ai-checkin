@@ -1,0 +1,13 @@
+{
+  "name": "ai-checkin-server",
+  "version": "1.0.0",
+  "description": "AI签到管家后端 - WorkBuddy加油站自动签到 + 通用HTTP签到引擎（零依赖）",
+  "main": "src/index.js",
+  "type": "module",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {}
+}

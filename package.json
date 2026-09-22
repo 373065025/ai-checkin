@@ -1,0 +1,15 @@
+{
+  "name": "ai-checkin",
+  "version": "1.0.3",
+  "description": "AI签到管家 — 飞牛 fnOS 应用：WorkBuddy 加油站自动签到 + 通用 HTTP 签到引擎（零依赖 Node 后端 + Vue3 前端）",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "npm --prefix web run build",
+    "update:tgz": "node tools/build-app-tgz.js",
+    "fpk": "node tools/build-fpk.js",
+    "release": "npm run build && node tools/build-app-tgz.js && node tools/build-fpk.js"
+  }
+}

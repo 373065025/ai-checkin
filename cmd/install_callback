@@ -1,0 +1,28 @@
+#!/bin/bash
+
+APP_DIR="${TRIM_APPDEST:-/var/apps/ai-checkin}"
+CONFIG_DIR="${TRIM_PKGVAR:-/var/pkgvar/ai-checkin}"
+
+echo "[install_callback] APP_DIR=${APP_DIR}"
+echo "[install_callback] CONFIG_DIR=${CONFIG_DIR}"
+
+mkdir -p "${CONFIG_DIR}" 2>/dev/null || true
+
+if [ ! -f "${CONFIG_DIR}/settings.json" ]; then
+  cat > "${CONFIG_DIR}/settings.json" <<'SETTINGS'
+{
+  "providers": [],
+  "notify": { "enabled": false, "format": "generic", "url": "" },
+  "scheduler": { "runOnStart": true }
+}
+SETTINGS
+fi
+
+# node_modules is bundled with the package; npm fallback only
+cd "${APP_DIR}/server" 2>/dev/null || cd "${APP_DIR}/target/server" 2>/dev/null
+if [ ! -d "node_modules" ] && command -v npm >/dev/null 2>&1; then
+  npm install --omit=dev 2>&1 || echo "[install_callback] npm install failed (ok: server has no deps)"
+fi
+
+echo "[install_callback] Done."
+exit 0

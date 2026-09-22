@@ -1,0 +1,26 @@
+# 依赖
+node_modules/
+
+# 构建产物 / 打包输出
+web/dist/
+build/
+*.fpk
+*.tgz
+
+# 运行期数据（含登录 token / Cookie，切勿提交）
+config_data/
+data/
+*.log
+
+# 旧的 fpk 打包暂存目录
+app/
+
+# 本地临时 / 开发脚本
+_*.py
+_build.mjs
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+.workbuddy/
+__pycache__/

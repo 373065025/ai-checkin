@@ -1,0 +1,13 @@
+{
+  "network": {
+    "host": true,
+    "ports": [
+      {
+        "container": 8630,
+        "host": "${APP_PORT}",
+        "protocol": "tcp",
+        "desc": "AI签到管家 Web UI 与 API"
+      }
+    ]
+  }
+}

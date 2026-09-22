@@ -1,0 +1,54 @@
+name: release
+
+# 打 tag（如 v1.0.3）时自动：构建前端 → 生成热更新包与 fpk → 创建 Release 并上传附件
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: 安装前端依赖并构建
+        run: |
+          npm --prefix web install
+          npm --prefix web run build
+
+      - name: 读取版本号
+        id: ver
+        run: echo "version=$(node tools/build-app-tgz.js --manifest-only)" >> "$GITHUB_OUTPUT"
+
+      - name: 生成热更新包 app.tgz
+        run: node tools/build-app-tgz.js
+
+      - name: 生成安装包 fpk
+        run: node tools/build-fpk.js
+
+      - name: 上传构建产物（供下载查看）
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-checkin-${{ steps.ver.outputs.version }}
+          path: |
+            build/app-*.tgz
+            ai-checkin*.fpk
+
+      - name: 创建 Release 并上传附件
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          name: v${{ steps.ver.outputs.version }}
+          generate_release_notes: true
+          files: |
+            build/app-${{ steps.ver.outputs.version }}.tgz
+            ai-checkin${{ steps.ver.outputs.version }}.fpk

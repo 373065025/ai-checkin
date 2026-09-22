@@ -1,0 +1,13 @@
+{
+  ".url": {
+    "ai-checkin.main": {
+      "title": "AI签到管家",
+      "icon": "images/icon-{0}.png",
+      "type": "url",
+      "protocol": "http",
+      "port": "8630",
+      "url": "/",
+      "allUsers": true
+    }
+  }
+}

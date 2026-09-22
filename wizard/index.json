@@ -1,0 +1,10 @@
+[
+  {
+    "field": "APP_PORT",
+    "label": "Web 端口",
+    "type": "port",
+    "default": "8630",
+    "required": true,
+    "desc": "AI签到管家 Web 界面访问端口，建议保持 8630（桌面图标入口固定指向该端口）"
+  }
+]

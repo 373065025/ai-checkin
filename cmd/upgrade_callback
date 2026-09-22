@@ -1,0 +1,6 @@
+#!/bin/bash
+
+CONFIG_DIR="${TRIM_PKGVAR:-/var/pkgvar/ai-checkin}"
+mkdir -p "${CONFIG_DIR}" 2>/dev/null || true
+echo "[upgrade_callback] Existing settings preserved at ${CONFIG_DIR}/settings.json"
+exit 0

@@ -1,0 +1,85 @@
+#!/bin/bash
+
+APP="ai-checkin"
+PIDFILE="/tmp/ai-checkin.pid"
+LOGFILE="/tmp/ai-checkin.log"
+PORT=8630
+
+# Add Node.js to PATH
+for d in /vol1/@appcenter/nodejs_v22/bin /vol1/@appcenter/nodejs_v20/bin /vol1/@appcenter/nodejs_v24/bin /usr/local/bin /usr/bin; do
+  [ -d "$d" ] && export PATH="${d}:$PATH"
+done
+
+find_server() {
+  for d in \
+    "${TRIM_APPDEST}/target/server" \
+    "${TRIM_APPDEST}/server" \
+    "/var/apps/${APP}/server" \
+    "/vol1/@appcenter/${APP}/server"; do
+    if [ -f "${d}/src/index.js" ]; then
+      echo "${d}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+case "${1:-}" in
+  start)
+    if [ -f "$PIDFILE" ]; then
+      PID=$(cat "$PIDFILE")
+      if kill -0 "$PID" 2>/dev/null; then
+        echo "Already running (PID: $PID)"
+        exit 0
+      fi
+      rm -f "$PIDFILE"
+    fi
+
+    SERVER_DIR=$(find_server)
+    if [ -z "$SERVER_DIR" ]; then
+      echo "ERROR: server not found" >&2
+      exit 1
+    fi
+
+    echo "Starting ${APP} from ${SERVER_DIR}"
+    export NODE_ENV=production
+    # 安装向导可改端口；未指定时用默认 8630
+    export PORT="${APP_PORT:-8630}"
+    export CONFIG_DIR="${TRIM_PKGVAR:-/var/pkgvar/${APP}}"
+
+    cd "${SERVER_DIR}" || exit 1
+    nohup node src/index.js > "$LOGFILE" 2>&1 &
+    echo $! > "$PIDFILE"
+    echo "Started (PID: $!)"
+    ;;
+
+  stop)
+    if [ -f "$PIDFILE" ]; then
+      PID=$(cat "$PIDFILE")
+      kill "$PID" 2>/dev/null
+      sleep 1
+      kill -9 "$PID" 2>/dev/null || true
+      rm -f "$PIDFILE"
+    fi
+    echo "Stopped."
+    ;;
+
+  status)
+    if [ -f "$PIDFILE" ]; then
+      PID=$(cat "$PIDFILE")
+      if kill -0 "$PID" 2>/dev/null; then
+        echo "Running (PID: $PID)"
+        exit 0
+      fi
+    fi
+    echo "Stopped"
+    exit 3
+    ;;
+
+  *)
+    echo "Usage: $0 {start|stop|status}" >&2
+    exit 2
+    ;;
+esac
+
+exit 0

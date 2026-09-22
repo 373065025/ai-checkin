@@ -1,0 +1,14 @@
+appname          = ai-checkin
+version          = 1.0.3
+display_name     = AI签到管家
+desc             = WorkBuddy 加油站自动签到与任务助手：积分状态、每日自动签到、派猫猫旅行先领后派闭环、成长计划只读展示、通用 HTTP 签到（支持 cURL 导入）、定时调度与 Webhook 通知
+platform         = x86
+source           = thirdparty
+maintainer       = AGG
+maintainer_url   = https://github.com/AGG
+distributor      = AGG
+distributor_url  = https://github.com/AGG
+os_min_version   = 1.0.0
+desktop_uidir    = ui
+desktop_applaunchname = ai-checkin.main
+service_port     = 8630
