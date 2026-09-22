@@ -130,9 +130,11 @@ async function handleApi(req, res, url) {
     if (idx >= 0) {
       const old = s.providers[idx];
       const next = { ...old, ...body, id: old.id };
-      // token 为空 → 保留旧值（前端不回传明文）
-      if (old.type === 'workbuddy' && (!next.token || next.token === '__KEEP__')) next.token = old.token;
-      if (old.type === 'workbuddy' && !next.token) next.token = old.token;
+      // token 语义：'__CLEAR__' 显式清除；空值/'__KEEP__' 保留旧值（前端不回传明文）
+      if (old.type === 'workbuddy') {
+        if (next.token === '__CLEAR__') next.token = '';
+        else if (!next.token || next.token === '__KEEP__') next.token = old.token;
+      }
       s.providers[idx] = next;
     } else {
       const np = {

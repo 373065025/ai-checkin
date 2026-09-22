@@ -18,6 +18,8 @@ app/
 # 本地临时 / 开发脚本
 _*.py
 _build.mjs
+_shots/
+_smoke*
 
 # 系统 / 编辑器
 .DS_Store

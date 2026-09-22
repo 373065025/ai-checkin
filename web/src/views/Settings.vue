@@ -1,48 +1,14 @@
 <script setup>
 import { ref, inject, computed, onMounted, onUnmounted } from 'vue'
-import { saveSettings, importWb, saveProvider, testNotify, getSystemInfo, getUpdateInfo, checkUpdate, getUpdateStatus, getUpdateBackups, applyUpdate, rollbackUpdate, saveUpdateConfig } from '../api/index.js'
+import { saveSettings, testNotify, getSystemInfo, getUpdateInfo, checkUpdate, getUpdateStatus, getUpdateBackups, applyUpdate, rollbackUpdate, saveUpdateConfig } from '../api/index.js'
 
 const state = inject('state')
 const refresh = inject('refresh')
 const toast = inject('toast')
 
-const rawToken = ref('')
-const importing = ref(false)
-const fileInput = ref(null)
 const notifyForm = ref(JSON.parse(JSON.stringify(state.value.notify || {})))
 const schedulerForm = ref(JSON.parse(JSON.stringify(state.value.scheduler || {})))
 const testing = ref(false)
-
-const wb = () => state.value.providers.find((p) => p.type === 'workbuddy')
-
-function onFile(e) {
-  const f = e.target.files?.[0]
-  if (!f) return
-  const reader = new FileReader()
-  reader.onload = () => { rawToken.value = String(reader.result || '') }
-  reader.readAsText(f)
-}
-
-async function doImport() {
-  if (!rawToken.value.trim()) { toast('请先粘贴登录态内容或 token', 'err'); return }
-  importing.value = true
-  try {
-    const r = await importWb(rawToken.value)
-    const p = wb()
-    await saveProvider({ ...p, token: r.token, domain: r.domain })
-    rawToken.value = ''
-    await refresh()
-    toast(`导入成功（${r.masked}）`)
-  } catch (e) { toast(e.message, 'err') }
-  importing.value = false
-}
-
-async function clearToken() {
-  if (!confirm('确定清除已保存的 token？清除后自动签到将停止。')) return
-  await saveProvider({ ...wb(), token: '' })
-  await refresh()
-  toast('已清除')
-}
 
 async function saveNotify() {
   try {
@@ -62,23 +28,14 @@ async function testPush() {
   testing.value = false
 }
 
-// ===== 自动更新（同一张卡片：没新版本=检查，有新版本=更新） =====
+// ===== 版本更新（更新源固定为项目仓库，不开放其他配置） =====
 const version = ref('')
 const updateInfo = ref(null)
 const checking = ref(false)
 const showUpdate = ref(false)
 const backups = ref([])
 const updateUrl = ref('')
-const updateAltUrl = ref('')
 const autoCheck = ref(true)
-const showAdvanced = ref(false)
-const usingBuiltin = ref(true)
-const updateSources = ref([])
-const updateToken = ref('')
-const updateUser = ref('')
-const updatePassword = ref('')
-const hasToken = ref(false)
-const hasBasic = ref(false)
 const upState = ref({ state: 'idle', progress: 0, message: '', error: '' })
 const saved = ref(false)
 const savedTimer = ref(null)
@@ -88,22 +45,15 @@ const hasUpdate = computed(() => !!updateInfo.value?.hasUpdate)
 const busy = computed(() => UPDATE_BUSY.includes(upState.value.state))
 const canClose = computed(() => !UPDATE_BUSY.includes(upState.value.state))
 
+const repoMatch = computed(() => (updateUrl.value || '').match(/github\.com\/([^/]+)\/([^/?#]+)/i))
+const repoLabel = computed(() => (repoMatch.value ? `GitHub · ${repoMatch.value[1]}/${repoMatch.value[2]}` : '未配置更新源'))
+const repoHref = computed(() => (repoMatch.value ? `https://github.com/${repoMatch.value[1]}/${repoMatch.value[2]}` : ''))
+
 const mainButtonText = computed(() => {
   if (checking.value) return '检查中…'
   if (busy.value) return '更新中…'
   if (hasUpdate.value) return `更新到 v${updateInfo.value.latest}`
   return '检查更新'
-})
-
-const sourceNote = computed(() => {
-  if (updateUrl.value) {
-    return /github\.com|api\.github\.com/i.test(updateUrl.value)
-      ? 'GitHub Releases 更新源'
-      : '自定义更新源'
-  }
-  return updateSources.value.length > 1
-    ? '内置更新源（主源不可用时自动切换备用源）'
-    : '未配置更新源（请在高级设置填写）'
 })
 
 const statusText = computed(() => {
@@ -124,12 +74,7 @@ async function loadSystemInfo() {
     version.value = info.version
     backups.value = info.backups || []
     updateUrl.value = info.updateUrl || ''
-    updateAltUrl.value = info.updateAltUrl || ''
     autoCheck.value = info.autoCheckUpdate !== false
-    hasToken.value = !!info.hasUpdateToken
-    hasBasic.value = !!info.hasBasicAuth
-    usingBuiltin.value = info.usingBuiltinSource !== false
-    updateSources.value = info.updateSources || []
   } catch {}
   try { backups.value = await getUpdateBackups() } catch {}
 }
@@ -148,30 +93,8 @@ function onMainAction() {
   else doCheck()
 }
 
-async function saveUpdateUrl() {
-  try {
-    await saveUpdateConfig({ url: updateUrl.value, altUrl: updateAltUrl.value })
-    flashSaved()
-    await loadSystemInfo()
-    updateInfo.value = null
-  } catch {}
-}
-
 async function saveAuto() {
   try { await saveUpdateConfig({ autoCheck: autoCheck.value }); flashSaved() } catch {}
-}
-
-async function saveAuth() {
-  const patch = { user: updateUser.value, password: updatePassword.value }
-  if (updateToken.value) patch.token = updateToken.value
-  try {
-    const r = await saveUpdateConfig(patch)
-    hasToken.value = !!r.hasToken
-    hasBasic.value = !!r.hasBasic
-    updateToken.value = ''
-    flashSaved()
-    await loadSystemInfo()
-  } catch {}
 }
 
 async function startUpdate() {
@@ -223,38 +146,10 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
 <template>
   <div>
     <div class="page-title">设置</div>
-    <div class="page-sub">WorkBuddy 登录态、定时策略与结果推送</div>
+    <div class="page-sub">程序自身的运行策略与版本更新</div>
 
     <div class="panel">
-      <h3>🔑 WorkBuddy 登录态</h3>
-      <div class="hint" style="margin-bottom:12px">
-        NAS 上没有 WorkBuddy 客户端，需要从电脑端导入一次登录 token：<br />
-        1. 电脑端登录 WorkBuddy 后，打开文件
-        <code>%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info</code>
-        （macOS：<code>~/Library/Application Support/CodeBuddyExtension/.../workbuddy-desktop.info</code>）；<br />
-        2. 把整个文件内容粘贴到下面（或直接选择该文件），系统自动提取 <code>accessToken</code> 与 <code>domain</code>；也支持直接粘贴 token 本体（以 <code>eyJ</code> 开头）。<br />
-        token 只保存在 NAS 本机配置目录，界面仅显示掩码。token 过期时重新导入一次即可。
-      </div>
-      <div class="field">
-        <label>当前状态</label>
-        <div>
-          <span class="tag" :class="wb()?.tokenPresent ? 'ok' : 'err'">{{ wb()?.tokenPresent ? wb().tokenMasked : '未配置' }}</span>
-          <span class="tag" v-if="wb()?.domain" style="margin-left:6px">{{ wb().domain }}</span>
-        </div>
-      </div>
-      <div class="field">
-        <label>粘贴登录态 JSON 或 token</label>
-        <textarea v-model="rawToken" placeholder='{"auth":{"accessToken":"eyJ...","domain":"www.codebuddy.cn"}}'></textarea>
-      </div>
-      <div class="inline">
-        <button class="btn primary" :disabled="importing" @click="doImport">{{ importing ? '导入中…' : '导入并保存' }}</button>
-        <label class="btn" style="cursor:pointer">选择 .info 文件<input ref="fileInput" type="file" style="display:none" @change="onFile" /></label>
-        <button class="btn danger" v-if="wb()?.tokenPresent" @click="clearToken">清除已保存 token</button>
-      </div>
-    </div>
-
-    <div class="panel">
-      <h3>⏰ 定时策略</h3>
+      <h3>定时策略</h3>
       <div class="inline" style="margin-bottom:12px">
         <label class="switch">
           <input type="checkbox" v-model="schedulerForm.runOnStart" />
@@ -262,12 +157,12 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
         </label>
         <span style="font-size:13.5px">应用启动 / NAS 重启后，当天还没跑过的启用任务自动补跑一次（不怕漏签）</span>
       </div>
-      <div class="hint">每个任务自己的每日执行时间点在「签到任务 → 编辑」里配置；调度器每 30 秒检查一次。</div>
+      <div class="hint">每个任务自己的每日执行时间与登录态，都在「签到任务 → 编辑」里单独配置；调度器每 30 秒检查一次。</div>
     </div>
 
     <div class="panel">
-      <h3>📤 结果推送（可选）</h3>
-      <div class="hint" style="margin-bottom:12px">定时执行后把结果推送到你的消息渠道；仅推送结果文本，不含任何 token。</div>
+      <h3>结果推送（可选）</h3>
+      <div class="hint" style="margin-bottom:12px">定时执行后把结果推送到你的消息渠道；仅推送结果文本，不含任何凭据。</div>
       <div class="inline" style="margin-bottom:12px">
         <label class="switch"><input type="checkbox" v-model="notifyForm.enabled" /><span class="track"></span></label>
         <span style="font-size:13.5px">启用推送</span>
@@ -295,10 +190,10 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
     </div>
 
     <div class="panel">
-      <h3>📁 数据与安全</h3>
+      <h3>数据与安全</h3>
       <div class="hint">
-        配置目录：<code>{{ state.configDir }}</code>（settings.json 存任务与 token，logs.json 存日志）<br />
-        安全边界：后端只调用 WorkBuddy 官方已验证的 3 个写接口（签到 / 旅行领取 / 旅行派遣），绝不调用兑换、抽奖等接口；成长计划与旅行状态均为只读查询；token 永不回传给前端。
+        配置目录：<code>{{ state.configDir }}</code>（settings.json 存任务与凭据，logs.json 存日志）<br />
+        所有凭据只保存在 NAS 本机配置目录，Web 界面仅显示掩码、日志中永不出现；后端只调用各平台已验证的写入接口，不做兑换、抽奖等操作。
       </div>
     </div>
 
@@ -337,44 +232,15 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
       <div class="update-foot">
         <span class="up-src-note">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
-          {{ sourceNote }}
+          更新源：<template v-if="repoHref"><a :href="repoHref" target="_blank" rel="noreferrer">{{ repoLabel }}</a></template><template v-else>{{ repoLabel }}</template>
         </span>
-        <button class="link-btn" @click="showAdvanced = !showAdvanced">{{ showAdvanced ? '收起高级设置' : '高级设置' }}</button>
-      </div>
-
-      <div v-if="showAdvanced" class="update-advanced">
-        <p class="auth-hint">
-          从 GitHub 更新：把新版本在 Release 里上传 <code>app-&lt;版本&gt;.tgz</code>（上传 .fpk 也可以，会自动拆包），
-          下面填你的仓库地址即可。改动 <b>https://github.com/&lt;用户名&gt;/&lt;仓库&gt;</b> 会自动换算成 releases/latest。
-        </p>
-        <div class="auth-row">
-          <label class="auth-label">更新源</label>
-          <input v-model="updateUrl" class="setting-input" autocomplete="off" placeholder="GitHub 仓库：https://github.com/373065025/ai-checkin/releases/latest" @change="saveUpdateUrl" />
-        </div>
-        <div class="auth-row">
-          <label class="auth-label">备用源</label>
-          <input v-model="updateAltUrl" class="setting-input" autocomplete="off" placeholder="主源失败时自动切换（可选）" @change="saveUpdateUrl" />
-        </div>
-        <div class="auth-row">
-          <label class="auth-label">访问令牌</label>
-          <input
-            v-model="updateToken" type="password" class="setting-input" autocomplete="off"
-            :placeholder="hasToken ? '已保存，留空表示不修改' : 'GitHub 令牌（可选，仅用于提升 API 限额 / 私有仓库）'" @change="saveAuth" />
-        </div>
-        <div class="auth-row">
-          <label class="auth-label">用户名</label>
-          <input v-model="updateUser" class="setting-input" autocomplete="off" placeholder="仅自建更新源（Basic 认证）时需要" @change="saveAuth" />
-          <label class="auth-label">密码</label>
-          <input v-model="updatePassword" type="password" class="setting-input" autocomplete="new-password" placeholder="对应密码" @change="saveAuth" />
-        </div>
-        <p class="auth-hint">
-          <template v-if="hasToken">当前：访问令牌已配置</template>
-          <template v-else-if="hasBasic">当前：Basic 认证已配置</template>
-          <template v-else>GitHub 公开仓库无需令牌（未登录时 GitHub API 每小时限 60 次，够用；填令牌可提到 5000 次）</template>
-        </p>
-        <div class="adv-row">
-          <label class="opt"><input type="checkbox" v-model="autoCheck" @change="saveAuto" /><span>自动检查更新（启动 + 每 6 小时）</span></label>
-          <button v-if="backups.length" class="btn small" @click="doRollback">回滚到 v{{ backups[0] }}</button>
+        <div class="foot-actions" style="align-items:center;gap:14px">
+          <label class="opt">
+            <span class="switch"><input type="checkbox" v-model="autoCheck" @change="saveAuto" /><span class="track"></span></span>
+            自动检查更新
+          </label>
+          <span v-if="saved" class="hint" style="margin:0">已保存</span>
+          <button v-if="backups.length" class="link-btn" @click="doRollback">回滚到 v{{ backups[0] }}</button>
         </div>
       </div>
     </div>
@@ -406,10 +272,7 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
             </p>
           </div>
           <div class="modal-foot">
-            <span class="foot-note">
-              更新源：{{ updateInfo?.sourceLabel || (updateInfo?.source === 'github' ? 'GitHub Releases' : '自定义') }}
-              <template v-if="updateInfo?.fallback">（主源不可用，已自动切到备用源）</template>
-            </span>
+            <span class="foot-note">更新源：{{ repoLabel }}</span>
             <div class="foot-actions">
               <button class="btn small" v-if="canClose" @click="showUpdate = false">稍后</button>
               <button class="btn small primary" :disabled="!canClose" @click="startUpdate">

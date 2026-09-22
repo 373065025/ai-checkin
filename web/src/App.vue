@@ -35,12 +35,12 @@ onMounted(() => { refresh(); checkNavUpdate() })
   <div class="sidebar">
     <div class="logo">📌 AI签到管家<small>{{ VERSION }} · 飞牛 fnOS</small></div>
     <router-link class="nav-item" :class="{ active: route.path === '/' }" to="/"><span class="icon">🏠</span>签到中心</router-link>
-    <router-link class="nav-item" :class="{ active: route.path === '/tasks' }" to="/tasks"><span class="icon">✅</span>平台任务</router-link>
+    <router-link class="nav-item" :class="{ active: route.path === '/tasks' }" to="/tasks"><span class="icon">✅</span>签到任务</router-link>
     <router-link class="nav-item" :class="{ active: route.path === '/logs' }" to="/logs"><span class="icon">📋</span>执行日志</router-link>
     <router-link class="nav-item" :class="{ active: route.path === '/settings' }" to="/settings"><span class="icon">⚙️</span>设置<span v-if="hasUpdate" class="nav-dot"></span></router-link>
     <div class="sidebar-footer">
-      <div>零依赖 Node 后端</div>
-      <div>数据目录见「设置」页</div>
+      <div>零依赖 Node 后端 · 数据全在本机</div>
+      <div>config 目录见「设置」页</div>
     </div>
   </div>
   <div class="main">

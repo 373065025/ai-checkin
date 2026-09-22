@@ -1,6 +1,6 @@
 <script setup>
-import { ref, inject } from 'vue'
-import { saveProvider, deleteProvider, toggleProvider, runProvider, parseCurl } from '../api/index.js'
+import { ref, inject, computed } from 'vue'
+import { saveProvider, deleteProvider, toggleProvider, runProvider, parseCurl, importWb } from '../api/index.js'
 
 const state = inject('state')
 const refresh = inject('refresh')
@@ -10,6 +10,17 @@ const editing = ref(null)
 const runningId = ref(null)
 const curlText = ref('')
 const showCurl = ref(false)
+
+// WorkBuddy 登录态（迁至任务内，每个任务单独配置）
+const wbRaw = ref('')
+const wbImporting = ref(false)
+const wbHasToken = ref(false)
+const wbMasked = ref('')
+const wbConfigured = computed(() => {
+  const t = editing.value?.token
+  if (t === '__CLEAR__') return false
+  return !!t || wbHasToken.value
+})
 
 function newHttp() {
   return {
@@ -29,9 +40,47 @@ function editProvider(p) {
     e.http.successRule = e.http.successRule || { kind: 'status', expr: '200', value: '' }
   }
   if (!e.schedule) e.schedule = { times: ['09:00'] }
+  if (e.type === 'workbuddy') {
+    wbHasToken.value = !!p.tokenPresent
+    wbMasked.value = p.tokenMasked || ''
+    delete e.tokenMasked
+    delete e.tokenPresent
+  }
   editing.value = e
+  wbRaw.value = ''
   curlText.value = ''
   showCurl.value = false
+}
+
+function onWbFile(ev) {
+  const f = ev.target.files?.[0]
+  if (!f) return
+  const reader = new FileReader()
+  reader.onload = () => { wbRaw.value = String(reader.result || '') }
+  reader.readAsText(f)
+  ev.target.value = ''
+}
+
+async function doWbImport() {
+  if (!wbRaw.value.trim()) { toast('请先粘贴登录态内容或 token', 'err'); return }
+  wbImporting.value = true
+  try {
+    const r = await importWb(wbRaw.value)
+    editing.value.token = r.token
+    editing.value.domain = r.domain || editing.value.domain
+    wbHasToken.value = true
+    wbMasked.value = r.masked
+    wbRaw.value = ''
+    toast(`登录态已导入（${r.masked}），保存后生效`)
+  } catch (e) { toast(e.message, 'err') }
+  wbImporting.value = false
+}
+
+function clearWbToken() {
+  editing.value.token = '__CLEAR__'
+  wbHasToken.value = false
+  wbMasked.value = ''
+  toast('已标记清除，保存后生效')
 }
 
 function addTime() {
@@ -102,6 +151,8 @@ async function doCurlImport() {
 
 async function save() {
   const e = JSON.parse(JSON.stringify(editing.value))
+  delete e.tokenMasked
+  delete e.tokenPresent
   if (e.type === 'http') {
     const headers = {}
     for (const line of (e.http.headersText || '').split('\n')) {
@@ -156,7 +207,7 @@ const typeText = (t) => (t === 'workbuddy' ? 'WorkBuddy 加油站' : 'HTTP 签�
     <div style="display:flex;justify-content:space-between;align-items:flex-start">
       <div>
         <div class="page-title">签到任务</div>
-        <div class="page-sub">每个任务可配置多个每日执行时间；WorkBuddy 任务在「设置」页配置 token</div>
+        <div class="page-sub">每个签到任务独立配置执行时间与登录态，互不影响</div>
       </div>
       <button class="btn primary" @click="editing = newHttp()">＋ 新增平台签到</button>
     </div>
@@ -167,7 +218,7 @@ const typeText = (t) => (t === 'workbuddy' ? 'WorkBuddy 加油站' : 'HTTP 签�
           {{ p.name }}
           <span class="tag">{{ typeText(p.type) }}</span>
           <span class="tag" :class="p.enabled ? 'ok' : ''">{{ p.enabled ? '已启用' : '已停用' }}</span>
-          <span v-if="p.type === 'workbuddy' && !p.tokenPresent" class="tag err">未配置 token</span>
+          <span v-if="p.type === 'workbuddy' && !p.tokenPresent" class="tag err">未配置登录态</span>
         </div>
         <div class="meta">
           每日执行：{{ (p.schedule?.times || []).join('、') || '未设置' }}
@@ -226,17 +277,47 @@ const typeText = (t) => (t === 'workbuddy' ? 'WorkBuddy 加油站' : 'HTTP 签�
         </div>
 
         <template v-if="editing.type === 'workbuddy'">
-          <div class="field">
-            <label>自动行为</label>
-            <div class="inline" style="margin-bottom:8px">
+          <div class="section-label">登录态</div>
+          <div class="addon">
+            <div class="addon-head">
+              <span class="addon-title">WorkBuddy 账号</span>
+              <span class="tag" :class="wbConfigured ? 'ok' : 'err'">
+                {{ wbConfigured ? (wbMasked || '已配置') : '未配置登录态' }}
+              </span>
+            </div>
+            <div class="field">
+              <label>粘贴登录态 JSON 或 token</label>
+              <textarea v-model="wbRaw" placeholder='{"auth":{"accessToken":"eyJ...","domain":"www.codebuddy.cn"}}'></textarea>
+            </div>
+            <div class="inline">
+              <button class="btn small primary" :disabled="wbImporting" @click="doWbImport">
+                {{ wbImporting ? '导入中…' : '导入登录态' }}
+              </button>
+              <label class="btn small" style="cursor:pointer">
+                选择 .info 文件
+                <input type="file" accept=".info,.json,.txt" style="display:none" @change="onWbFile" />
+              </label>
+              <button class="btn small danger" v-if="wbConfigured" @click="clearWbToken">清除登录态</button>
+            </div>
+          </div>
+          <div class="hint" style="margin-bottom:18px">
+            NAS 上没有 WorkBuddy 客户端，需从电脑端导入一次登录态：电脑端登录 WorkBuddy 后打开
+            <code>%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info</code>，
+            把整个文件内容粘贴到上面（或直接选择该文件），系统自动提取 <code>accessToken</code> 与 <code>domain</code>；
+            也支持直接粘贴 token 本体（以 <code>eyJ</code> 开头）。凭据只保存在 NAS 本机配置目录，界面仅显示掩码，过期后重新导入即可。
+          </div>
+
+          <div class="section-label">自动行为</div>
+          <div class="addon">
+            <div class="inline" style="margin-bottom:12px">
               <label class="switch"><input type="checkbox" v-model="editing.autoCheckin" /><span class="track"></span></label>
               <span style="font-size:13.5px">每日自动签到（幂等，先查后签）</span>
             </div>
-            <div class="inline" style="margin-bottom:8px">
+            <div class="inline" style="margin-bottom:12px">
               <label class="switch"><input type="checkbox" v-model="editing.travelAuto" /><span class="track"></span></label>
               <span style="font-size:13.5px">派猫猫旅行自动闭环（到达先领积分，再自动派遣）</span>
             </div>
-            <div class="row" v-if="editing.travelAuto !== false" style="max-width:260px">
+            <div class="row" v-if="editing.travelAuto !== false" style="max-width:280px">
               <select v-model.number="editing.locationId">
                 <option :value="0">派遣地点：随机</option>
                 <option :value="1">咖啡馆</option>

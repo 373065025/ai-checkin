@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { uid } from './util.js';
 
-export const VERSION = '1.0.3';
+export const VERSION = '1.0.4';
 const CONFIG_DIR = process.env.CONFIG_DIR || path.join(process.cwd(), 'config_data');
 
 export function configDir() { return CONFIG_DIR; }

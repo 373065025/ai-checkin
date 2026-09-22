@@ -59,12 +59,12 @@ NAS 上没有 WorkBuddy 客户端，需要从电脑端导入一次 token：
 2. 打开文件
    - Windows：`%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info`
    - macOS：`~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`
-3. 全选复制 → 粘贴到应用「设置」页（或点「选择 .info 文件」上传）→ **导入并保存**
+3. 全选复制 → 在「签到任务」页点开 WorkBuddy 任务的**编辑** → 「登录态」里粘贴（或点「选择 .info 文件」）→ **导入登录态** → 保存
 
-token 只保存在 NAS 本机的配置目录，界面只显示掩码；过期后重新导入即可。
+登录态是**按任务保存**的，每个任务各自一份；只保存在 NAS 本机的配置目录，界面只显示掩码，过期后重新导入即可。
 
 ### 2. 配置任务
-「平台任务」页可新建 / 编辑 / 启停任务，配置每日执行时间点；
+「签到任务」页可新建 / 编辑 / 启停任务，配置每日执行时间点与各自的登录态；
 HTTP 签到任务支持从 cURL 一键导入。
 
 ## 应用内自动更新（GitHub Releases）
@@ -77,7 +77,7 @@ https://github.com/373065025/ai-checkin/releases/latest
 
 - 启动后 + 每 6 小时自动检查一次，也可在设置页手动点「检查更新」
 - 发现新版本 → 弹窗确认 → 自动备份当前版本（可回滚）→ 下载 → 校验 SHA256 → 热替换 → 自动重启
-- GitHub 未登录时 API 限 60 次/小时（够用）；如需更高额度或私有仓库，可在「高级设置 → 访问令牌」填 GitHub Token
+- 更新源固定在项目仓库，设置页只读展示；GitHub 未登录时 API 限 60 次/小时（对 6 小时一次的检查完全够用）
 
 **发布新版本时**，只需在 GitHub 建一个 Release，附上更新包：
 
@@ -97,12 +97,13 @@ node tools/build-fpk.js
 也可以打 tag 让 GitHub Actions 自动构建并发布（见 `.github/workflows/release.yml`）：
 
 ```bash
-git tag v1.0.3 && git push origin v1.0.3
+git tag v1.0.4 && git push origin v1.0.4
 ```
 
-> 更换更新源：设置 → 版本更新 → 高级设置 → 「更新源」。
-> 既可填 GitHub 仓库地址（`https://github.com/<用户名>/<仓库>`，自动换算成 releases/latest），
-> 也可填任意返回 `{ version, notes, url, sha256, size }` 的自定义更新清单地址。
+> 更新源默认即本仓库（`https://github.com/373065025/ai-checkin/releases/latest`），
+> 在设置页只读展示，无需也不开放额外配置。
+> 后端 `updater.js` 仍保留自定义清单（`{ version, notes, url, sha256, size }`）与 GitHub 地址自动换算能力，
+> 便于自行 fork 后改用自己的仓库。
 
 ## 目录结构
 

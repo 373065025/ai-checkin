@@ -23,15 +23,15 @@ const signedTodayCount = computed(() => {
 
 function platformMeta(p) {
   if (p.type === 'workbuddy') {
-    return { icon: '🐾', color: '#22c7a9', alias: 'WorkBuddy' }
+    return { icon: '🐾', color: '#30d158', alias: 'WorkBuddy' }
   }
   const n = p.name.toLowerCase()
-  if (n.includes('千帆') || n.includes('百度')) return { icon: '🌊', color: '#2468f2', alias: '百度千帆' }
-  if (n.includes('minimax') || n.includes('mini')) return { icon: '🤖', color: '#6b4cff', alias: 'MiniMax' }
-  if (n.includes('tree')) return { icon: '🌳', color: '#2ecc71', alias: 'Tree Work' }
-  if (n.includes('wps')) return { icon: '📄', color: '#ff4d4d', alias: 'WPS' }
-  if (n.includes('link')) return { icon: '🔗', color: '#00d2ff', alias: 'Link AI' }
-  return { icon: '⚙️', color: '#5b8cff', alias: '自定义' }
+  if (n.includes('千帆') || n.includes('百度')) return { icon: '🌊', color: '#0a84ff', alias: '百度千帆' }
+  if (n.includes('minimax') || n.includes('mini')) return { icon: '🤖', color: '#bf5af2', alias: 'MiniMax' }
+  if (n.includes('tree')) return { icon: '🌳', color: '#30d158', alias: 'Tree Work' }
+  if (n.includes('wps')) return { icon: '📄', color: '#ff453a', alias: 'WPS' }
+  if (n.includes('link')) return { icon: '🔗', color: '#64d2ff', alias: 'Link AI' }
+  return { icon: '⚙️', color: '#8e8e93', alias: '自定义' }
 }
 
 function liveOf(p) {
@@ -150,9 +150,9 @@ function goTasks() { router.push('/tasks') }
         </div>
       </div>
       <div class="right">
-        <button class="btn" @click="refresh(); loadLives()">🔄 刷新</button>
+        <button class="btn" @click="refresh(); loadLives()">刷新</button>
         <button class="btn primary" :disabled="runningAll" @click="doRunAll">
-          {{ runningAll ? '签到中…' : '▶ 一键签到' }}
+          {{ runningAll ? '签到中…' : '一键签到' }}
         </button>
       </div>
     </div>
@@ -160,15 +160,15 @@ function goTasks() { router.push('/tasks') }
     <!-- 卡片墙 -->
     <div class="checkin-grid">
       <div v-for="p in state.providers" :key="p.id" class="checkin-card" :class="{ disabled: !p.enabled }"
-        :style="{ borderTopColor: platformMeta(p).color }">
+        :style="{ '--brand': platformMeta(p).color }">
         <div class="card-head">
-          <div class="brand-icon" :style="{ borderColor: platformMeta(p).color + '40' }">{{ platformMeta(p).icon }}</div>
+          <div class="brand-icon">{{ platformMeta(p).icon }}</div>
           <div class="card-title">{{ p.name }}</div>
           <div class="status-dot" :class="cardStatus(p).dot"></div>
           <span class="tag" :class="cardStatus(p).cls">{{ cardStatus(p).text }}</span>
         </div>
         <div class="card-body">
-          <div class="big">{{ bigValue(p).text }}<small>{{ bigValue(p).unit }}</small></div>
+          <div class="big" :class="{ placeholder: bigValue(p).text === '—' }">{{ bigValue(p).text }}<small>{{ bigValue(p).unit }}</small></div>
           <div class="detail" v-html="details(p).join(' · ')"></div>
         </div>
         <div class="card-foot">
@@ -185,11 +185,12 @@ function goTasks() { router.push('/tasks') }
 
     <!-- 未配置 WorkBuddy 提示 -->
     <div class="panel" style="margin-top:18px" v-if="!state.providers.find((p)=>p.type==='workbuddy')?.tokenPresent">
-      <h3>⚠️ WorkBuddy 尚未配置</h3>
-      <div class="hint">
-        请到 <b>设置</b> 页导入登录态；NAS 上没有 WorkBuddy 客户端，需要把电脑端的
-        <code>workbuddy-desktop.info</code> 文件内容粘贴进去。
+      <h3>WorkBuddy 尚未配置登录态</h3>
+      <div class="hint" style="margin-bottom:12px">
+        到「签到任务」页点开 WorkBuddy 任务的<b>编辑</b>，在<b>登录态</b>里粘贴一次即可（每个任务独立配置）。NAS 上没有 WorkBuddy
+        客户端，需要把电脑端 <code>workbuddy-desktop.info</code> 的文件内容复制过来。
       </div>
+      <button class="btn primary" @click="goTasks">去配置</button>
     </div>
   </div>
 </template>
