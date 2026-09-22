@@ -1,14 +1,28 @@
 <script setup>
 import { ref, inject, computed, onMounted, onUnmounted } from 'vue'
-import { saveSettings, testNotify, getSystemInfo, getUpdateInfo, checkUpdate, getUpdateStatus, getUpdateBackups, applyUpdate, rollbackUpdate, saveUpdateConfig } from '../api/index.js'
+import { saveSettings, testNotify, getSystemInfo, getUpdateInfo, checkUpdate, getUpdateStatus, getUpdateBackups, applyUpdate, rollbackUpdate, saveUpdateConfig, fmtTime } from '../api/index.js'
 
 const state = inject('state')
 const refresh = inject('refresh')
 const toast = inject('toast')
+const openAgreement = inject('openAgreement')
 
 const notifyForm = ref(JSON.parse(JSON.stringify(state.value.notify || {})))
 const schedulerForm = ref(JSON.parse(JSON.stringify(state.value.scheduler || {})))
 const testing = ref(false)
+
+// 推送渠道的输入框文案随渠道变化（PushPlus 填的是 Token，不是 Webhook 地址）
+const notifyFieldLabel = computed(() => (notifyForm.value.format === 'pushplus' ? 'PushPlus Token' : 'Webhook URL'))
+const notifyPlaceholder = computed(() => {
+  switch (notifyForm.value.format) {
+    case 'dingtalk': return 'https://oapi.dingtalk.com/robot/send?access_token=...'
+    case 'feishu': return 'https://open.feishu.cn/open-apis/bot/v2/hook/...'
+    case 'wecom': return 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=...'
+    case 'pushplus': return 'PushPlus token，或 https://www.pushplus.plus/send?token=你的token'
+    case 'bark': return 'https://api.day.app/你的Key'
+    default: return 'https://你的地址/webhook'
+  }
+})
 
 async function saveNotify() {
   try {
@@ -175,13 +189,19 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
             <option value="dingtalk">钉钉机器人</option>
             <option value="feishu">飞书机器人</option>
             <option value="wecom">企业微信机器人</option>
+            <option value="pushplus">PushPlus（ 微信公众号 ）</option>
             <option value="bark">Bark（iPhone）</option>
           </select>
         </div>
         <div class="field">
-          <label>Webhook URL</label>
-          <input type="text" v-model="notifyForm.url" placeholder="https://oapi.dingtalk.com/robot/send?access_token=..." />
+          <label>{{ notifyFieldLabel }}</label>
+          <input type="text" v-model="notifyForm.url" :placeholder="notifyPlaceholder" />
         </div>
+      </div>
+      <div v-if="notifyForm.format === 'pushplus'" class="hint" style="margin-bottom:12px">
+        在 <code>pushplus.plus</code> 用微信登录后，「一对一推送」页可直接复制 token，粘贴到上面即可；
+        也支持直接粘贴官方 <code>send</code> 地址。若使用群组推送，可在地址里附带 <code>&amp;topic=群组编码</code>，
+        需要 HTML/Markdown 排版可加 <code>&amp;template=html</code>。
       </div>
       <div class="inline">
         <button class="btn primary" @click="saveNotify">保存设置</button>
@@ -195,6 +215,17 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
         配置目录：<code>{{ state.configDir }}</code>（settings.json 存任务与凭据，logs.json 存日志）<br />
         所有凭据只保存在 NAS 本机配置目录，Web 界面仅显示掩码、日志中永不出现；后端只调用各平台已验证的写入接口，不做兑换、抽奖等操作。
       </div>
+    </div>
+
+    <div class="panel">
+      <h3>免责声明与用户协议</h3>
+      <div class="hint" style="margin-bottom:12px">
+        首次安装后需阅读并同意《用户协议与免责声明》才能使用；未同意时后端不会执行任何签到或自动化操作。<br />
+        协议状态：<span class="tag" :class="state.agreementAccepted ? 'ok' : 'err'">{{ state.agreementAccepted ? '已同意' : '未同意' }}</span>
+        <template v-if="state.agreement?.acceptedRevision"> · 已同意条款版本 {{ state.agreement.acceptedRevision }}</template>
+        <template v-if="state.agreement?.acceptedAt"> · 同意于 {{ fmtTime(state.agreement.acceptedAt) }}</template>
+      </div>
+      <button class="btn" @click="openAgreement()">查看协议全文</button>
     </div>
 
     <!-- 版本与更新 -->

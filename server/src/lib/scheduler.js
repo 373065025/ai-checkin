@@ -1,5 +1,5 @@
 // 定时调度器：每 30 秒检查一次，按每个任务配置的每日时间点触发
-import { get, save } from './store.js';
+import { get, save, isAgreementAccepted } from './store.js';
 import { runProvider } from './providers.js';
 import { nowHM, todayStr } from './util.js';
 import { sendNotify } from './notify.js';
@@ -8,6 +8,8 @@ let timer = null;
 let startedDay = null;
 
 async function tick() {
+  // 未同意用户协议前不执行任何自动化动作
+  if (!isAgreementAccepted()) return;
   const s = get();
   const hm = nowHM();
   const day = todayStr();
@@ -40,6 +42,7 @@ export function startScheduler() {
   timer = setInterval(tick, 30 * 1000);
   // 启动补跑：runOnStart 且今日未跑过的任务延迟 5 秒执行
   setTimeout(async () => {
+    if (!isAgreementAccepted()) return;
     const s = get();
     if (!s.scheduler?.runOnStart) return;
     const day = todayStr();

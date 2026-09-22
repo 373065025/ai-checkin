@@ -2,8 +2,9 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { uid } from './util.js';
+import { AGREEMENT_REVISION } from './agreement.js';
 
-export const VERSION = '1.0.4';
+export const VERSION = '1.0.5';
 const CONFIG_DIR = process.env.CONFIG_DIR || path.join(process.cwd(), 'config_data');
 
 export function configDir() { return CONFIG_DIR; }
@@ -16,6 +17,8 @@ export function defaultSettings() {
     providers: [],
     notify: { enabled: false, format: 'generic', url: '' },
     scheduler: { runOnStart: true },
+    // 用户协议：安装后首次使用必须同意；记录同意的条款版本，条款修订后会重新提示
+    agreement: { revision: '', acceptedAt: 0 },
     // 应用内自动更新配置（默认走 GitHub Releases；清空 url 即停用自动更新）
     update: {
       url: 'https://github.com/373065025/ai-checkin/releases/latest',
@@ -89,6 +92,34 @@ export function saveNow() {
   } catch (e) {
     console.error('[store] save settings failed:', e.message);
   }
+}
+
+// ---------- 用户协议 ----------
+
+/** 已同意的条款版本与当前条款版本一致才算通过（条款修订后会重新要求同意） */
+export function isAgreementAccepted() {
+  const a = get().agreement || {};
+  return !!a.revision && a.revision === AGREEMENT_REVISION;
+}
+
+export function getAgreementState() {
+  const a = get().agreement || {};
+  // 字段名刻意与协议正文的 revision（当前条款版本）区分开，避免拼装响应时互相覆盖
+  return { accepted: isAgreementAccepted(), acceptedRevision: a.revision || '', acceptedAt: a.acceptedAt || 0 };
+}
+
+export function acceptAgreement() {
+  const s = get();
+  s.agreement = { revision: AGREEMENT_REVISION, acceptedAt: Date.now() };
+  saveNow();
+  return getAgreementState();
+}
+
+export function revokeAgreement() {
+  const s = get();
+  s.agreement = { revision: '', acceptedAt: 0 };
+  saveNow();
+  return getAgreementState();
 }
 
 // ---------- 日志 ----------

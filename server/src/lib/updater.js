@@ -98,6 +98,45 @@ function absoluteUrl(baseUrl, u) {
 }
 
 /**
+ * GitHub Release 资产在部分网络（尤其国内 NAS）下无法直连：
+ * 表现就是 Node 的 `fetch failed`（真实原因藏在 err.cause.code，如 ENOTFOUND / ECONNRESET）。
+ * 这里准备一组公共加速前缀做兜底；**下载完一律用 GitHub 官方 sha256（asset.digest）校验**，
+ * 校验不过就丢弃，所以镜像即使返回错误内容也不会被安装。
+ */
+const GITHUB_MIRRORS = [
+  { label: 'ghproxy', prefix: 'https://ghproxy.net/' },
+  { label: 'gh-proxy', prefix: 'https://gh-proxy.com/' },
+  { label: 'ghfast', prefix: 'https://ghfast.top/' },
+];
+const GITHUB_ASSET_RE = /^https:\/\/github\.com\/[^/]+\/[^/]+\/releases\/download\//i;
+const DOWNLOAD_CANDIDATE_TIMEOUT_MS = 180000;
+
+/** 把底层网络错误翻译成人能看懂的话（Node 只给一句 "fetch failed"） */
+function explainFetchError(err, url) {
+  let host = '';
+  try { host = new URL(url).hostname } catch {}
+  const cause = err && err.cause ? err.cause : null;
+  const code = (cause && (cause.code || cause.errno)) || '';
+  const table = {
+    ENOTFOUND: `域名解析失败（${host}）—— DNS 解析不到该域名，多为网络/DNS 问题`,
+    EAI_AGAIN: `域名解析超时（${host}）—— DNS 暂时不可用，可稍后重试`,
+    ECONNRESET: `连接被重置（${host}）—— 常见于网络中间设备拦截`,
+    ECONNREFUSED: `连接被拒绝（${host}）`,
+    ETIMEDOUT: `连接超时（${host}）—— 网络不通或速度过慢`,
+    UND_ERR_CONNECT_TIMEOUT: `连接超时（${host}）`,
+    UND_ERR_SOCKET: `连接中断（${host}）`,
+    CERT_HAS_EXPIRED: `TLS 证书已过期（${host}）`,
+    UNABLE_TO_VERIFY_LEAF_SIGNATURE: `TLS 证书校验失败（${host}）—— 可能被中间设备劫持`,
+    DEPTH_ZERO_SELF_SIGNED_CERT: `TLS 自签名证书（${host}）`,
+  };
+  if (code && table[code]) return table[code];
+  if (err && (err.name === 'AbortError' || code === 'UND_ERR_ABORTED')) return `请求超时（${host}）`;
+  if (code) return `${host} 连接失败（${code}）`;
+  const detail = (cause && cause.message) || (err && err.message) || '未知错误';
+  return `${host} 请求失败：${detail}`;
+}
+
+/**
  * 把 GitHub 仓库地址换算成 GitHub API 地址。
  * 注意：API 形式必须在域名后带 /repos/，否则 api.github.com/owner/repo 会 404。
  * 支持这几种输入：
@@ -243,7 +282,9 @@ async function fetchManifest(url, headers = {}, timeout = 15000) {
       url: asset.browser_download_url,
       assetName: asset.name,
       size: asset.size || 0,
-      sha256: '',
+      // GitHub 现在会给资产算 sha256（形如 "sha256:abc..."），拿它做完整性校验，
+      // 这样即使走第三方镜像下载也能保证内容没被篡改。
+      sha256: String(asset.digest || '').replace(/^sha256:/i, ''),
       publishedAt: d.published_at || '',
       source: 'github',
     };
@@ -355,21 +396,66 @@ export async function performUpdate() {
   return { started: true, version: check.latest };
 }
 
-async function downloadFromSource(src) {
-  const man = await fetchManifest(src.url, src.headers, src.timeout);
+/** 单次下载：直连或镜像，返回 Buffer（含 gzip 魔数检查） */
+async function downloadOnce(url, headers, timeoutMs = DOWNLOAD_CANDIDATE_TIMEOUT_MS) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 300000);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   let resp;
   try {
-    resp = await fetch(man.url, { headers: src.headers, signal: ctrl.signal });
+    resp = await fetch(url, {
+      headers: { 'User-Agent': 'ai-checkin', ...headers },
+      signal: ctrl.signal,
+      redirect: 'follow',
+    });
+  } catch (err) {
+    throw new Error(explainFetchError(err, url));
   } finally {
     clearTimeout(timer);
   }
-  if (!resp.ok) throw new Error(`下载更新包 HTTP ${resp.status}`);
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
   const buf = Buffer.from(await resp.arrayBuffer());
-  if (!buf.length) throw new Error('下载到的更新包为空');
-  if (!looksLikeGzip(buf)) throw new Error('返回的不是更新包（鉴权失败或地址错误）');
-  return { buf, man };
+  if (!buf.length) throw new Error('下载内容为空');
+  if (!looksLikeGzip(buf)) throw new Error('返回的不是更新包（可能是登录页/错误页，或地址错误）');
+  return buf;
+}
+
+async function downloadFromSource(src) {
+  const man = await fetchManifest(src.url, src.headers, src.timeout);
+
+  // 候选地址：先直连，再依次尝试公共镜像
+  const candidates = [{ label: '直连', url: man.url, auth: true }];
+  if (man.source === 'github' && GITHUB_ASSET_RE.test(man.url)) {
+    for (const m of GITHUB_MIRRORS) candidates.push({ label: `镜像 ${m.label}`, url: m.prefix + man.url, auth: false });
+  }
+
+  const attempts = [];
+  for (const c of candidates) {
+    let lastErr = '';
+    for (let i = 1; i <= 2; i++) {
+      try {
+        // 注意：镜像绝不携带 Authorization，避免把 GitHub Token 泄露给第三方
+        const buf = await downloadOnce(c.url, c.auth ? src.headers : {});
+        if (man.sha256) {
+          const sha = createHash('sha256').update(buf).digest('hex');
+          if (sha.toLowerCase() !== man.sha256.toLowerCase()) {
+            throw new Error('内容校验不通过（SHA256 与官方不一致，已丢弃）');
+          }
+        } else if (man.size && buf.length !== man.size) {
+          throw new Error(`文件大小不符（期望 ${man.size} 字节，实际 ${buf.length} 字节）`);
+        }
+        return {
+          buf,
+          man: { ...man, viaMirror: !c.auth, downloadLabel: c.label },
+        };
+      } catch (err) {
+        lastErr = scrub(err.message);
+        if (i === 1) await new Promise((r) => setTimeout(r, 600)); // 首次失败多为瞬时抖动，短暂等待后重试
+      }
+    }
+    attempts.push(`${c.label}：${lastErr}`);
+  }
+
+  throw new Error('全部下载通道都失败（' + attempts.join('；') + '）');
 }
 
 /**
@@ -410,12 +496,18 @@ async function runUpdate(check, current) {
       latest = r.man;
       break;
     } catch (err) {
-      errors.push(`${src.label}：${scrub(err.message)}`);
+      errors.push(`${src.label} → ${scrub(err.message)}`);
       if (ordered.length > 1) task = { ...task, message: `${src.label}失败，正在换源重试…` };
     }
   }
   if (!pkg) {
-    throw new Error('所有更新源都下载失败 — ' + errors.join('；'));
+    throw new Error(
+      '下载更新包失败：' + errors.join('；') +
+      '。可直接到项目 Release 页下载 .fpk，在「应用中心 → 手动安装」升级（无需网络打通 GitHub 资产站）。'
+    );
+  }
+  if (latest.viaMirror) {
+    task = { ...task, message: `已通过${latest.downloadLabel}下载，SHA256 校验通过` };
   }
 
   // Release 里传的是 .fpk 的话，先拆出里面的 app.tgz 再安装

@@ -4,7 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { VERSION, load, get, save, addLog, getLogs, clearLogs, configDir } from './lib/store.js';
+import { VERSION, load, get, save, addLog, getLogs, clearLogs, configDir, isAgreementAccepted, getAgreementState, acceptAgreement, revokeAgreement } from './lib/store.js';
+import { agreementPayload, AGREEMENT_REVISION } from './lib/agreement.js';
 import { runProvider, liveSnapshot } from './lib/providers.js';
 import { startScheduler } from './lib/scheduler.js';
 import { sendNotify } from './lib/notify.js';
@@ -79,6 +80,16 @@ async function handleApi(req, res, url) {
     return json(res, 200, { ok: true, version: VERSION, time: nowText() });
   }
 
+  // 「同意才能使用」：未同意用户协议前，后端拒绝一切实际执行动作（不只是前端遮挡）
+  const AGREEMENT_GUARDED = ['/api/providers/run', '/api/run-all', '/api/notify/test'];
+  if (req.method === 'POST' && AGREEMENT_GUARDED.includes(p) && !isAgreementAccepted()) {
+    return json(res, 403, {
+      ok: false,
+      needAgreement: true,
+      message: '请先阅读并同意《用户协议与免责声明》后再使用',
+    });
+  }
+
   if (req.method === 'GET' && p === '/api/state') {
     return json(res, 200, {
       version: VERSION,
@@ -87,8 +98,23 @@ async function handleApi(req, res, url) {
       providers: s.providers.map(maskProvider),
       notify: s.notify,
       scheduler: s.scheduler,
+      agreementAccepted: isAgreementAccepted(),
+      agreement: getAgreementState(),
       logs: getLogs(300),
     });
+  }
+
+  // 用户协议与免责声明：内容由后端下发，前端渲染；同意状态落盘到本机配置
+  if (req.method === 'GET' && p === '/api/agreement') {
+    return json(res, 200, { ok: true, ...getAgreementState(), ...agreementPayload() });
+  }
+  if (req.method === 'POST' && p === '/api/agreement/accept') {
+    const st = acceptAgreement();
+    addLog({ providerName: '系统', trigger: 'manual', ok: true, message: `已同意《${agreementPayload().title}》（条款版本 ${AGREEMENT_REVISION}）`, durationMs: 0 });
+    return json(res, 200, { ok: true, ...st, revision: AGREEMENT_REVISION });
+  }
+  if (req.method === 'POST' && p === '/api/agreement/revoke') {
+    return json(res, 200, { ok: true, ...revokeAgreement() });
   }
 
   if (req.method === 'POST' && p === '/api/settings') {

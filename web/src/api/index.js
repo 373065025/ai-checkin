@@ -1,4 +1,4 @@
-const VERSION = 'v1.0.4'
+const VERSION = 'v1.0.5'
 
 export async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -34,6 +34,11 @@ export const getUpdateBackups = () => api('/api/system/update/backups')
 export const applyUpdate = () => api('/api/system/update/apply', { method: 'POST', body: '{}' })
 export const rollbackUpdate = (version) => api('/api/system/update/rollback', { method: 'POST', body: JSON.stringify({ version }) })
 export const saveUpdateConfig = (patch) => api('/api/system/update/config', { method: 'PUT', body: JSON.stringify(patch) })
+
+// ===== 用户协议与免责声明 =====
+export const getAgreement = () => api('/api/agreement')
+export const acceptAgreement = () => api('/api/agreement/accept', { method: 'POST', body: '{}' })
+export const revokeAgreement = () => api('/api/agreement/revoke', { method: 'POST', body: '{}' })
 
 export { VERSION }
 
