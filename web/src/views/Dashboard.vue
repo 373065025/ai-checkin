@@ -1,5 +1,5 @@
 <script setup>
-import { ref, inject, onMounted, computed } from 'vue'
+import { ref, inject, onMounted, computed, watch, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { runAll, runProvider, getProviderLive, todayStr, fmtTime } from '../api/index.js'
 
@@ -20,6 +20,9 @@ const totalEnabled = computed(() => enabledProviders.value.length)
 const signedTodayCount = computed(() => {
   return enabledProviders.value.filter((p) => isSignedToday(p)).length
 })
+
+// 是否有任务正在后台拉取最新数据（用于显示「更新中」而不是让人干等）
+const syncing = computed(() => enabledProviders.value.some((p) => liveOf(p)?.refreshing))
 
 function platformMeta(p) {
   if (p.type === 'workbuddy') {
@@ -79,8 +82,10 @@ function details(p) {
         out.push(`累计积分 <b>${st.total_credits ?? '—'}</b>`)
         out.push(`连续 <b>${st.streak_days ?? '—'}</b> 天`)
       }
-      // 本月打卡天数
-      out.push(`本月已签 <b>${st.checkin_dates_this_month?.length ?? 0}</b> 天`)
+      // 本月 / 本周打卡天数（后端会把上游的 checkin_dates 归一成本月数组）
+      const monthDays = st.checkin_dates_this_month?.length
+      if (monthDays != null) out.push(`本月 <b>${monthDays}</b> 天`)
+      if (st.week_checkin_days != null) out.push(`本周 <b>${st.week_checkin_days}</b> 天`)
     }
     const tr = liveOf(p)?.travel?.status
     if (tr) {
@@ -95,17 +100,70 @@ function details(p) {
   return out
 }
 
-async function loadLives() {
-  const ps = enabledProviders.value.filter((p) => p.type === 'workbuddy' && p.tokenPresent)
-  await Promise.all(ps.map(async (p) => {
-    try {
-      const r = await getProviderLive(p.id)
-      liveMap.value.set(p.id, r)
-    } catch { /* ignore */ }
-  }))
+// ===== 加载策略：先渲染已知状态，再后台拉最新 =====
+//
+// 一次实时快照要打 7 个远端请求（并行也要 1.5s 左右）。为了不再让页面卡着转圈：
+//   1) 后端 /api/state 会带上每个任务「上次已知的快照」→ 首屏立刻渲染（含「今日已签到」）
+//   2) 后端 /api/providers/live 有缓存就直接返回，过期则先返回旧值 + 后台刷新
+//   3) 后台刷新完成后前端自动补拉一次，全程不需要用户等待或手动点刷新
+const stampOf = (o) => (o && (o.ts || o.at || 0)) || 0
+let settleTimer = null
+let settleRounds = 0
+
+/** 用 state 里带回的上次快照填充 liveMap（只在更新时间更新时才覆盖） */
+function seedFromState() {
+  const ps = state.value?.providers || []
+  const next = new Map(liveMap.value)
+  let changed = false
+  for (const p of ps) {
+    if (!p.lastLive) continue
+    if (stampOf(p.lastLive) > stampOf(next.get(p.id))) {
+      next.set(p.id, p.lastLive)
+      changed = true
+    }
+  }
+  if (changed) liveMap.value = next
 }
 
-onMounted(async () => { await refresh(); await loadLives() })
+async function loadLives({ force = false } = {}) {
+  const ps = enabledProviders.value.filter((p) => p.type === 'workbuddy' && p.tokenPresent)
+  if (!ps.length) return
+  const out = await Promise.all(ps.map(async (p) => {
+    try { return [p.id, await getProviderLive(p.id, force)] } catch { return null }
+  }))
+  const next = new Map(liveMap.value)
+  let pending = false
+  for (const r of out) {
+    if (!r) continue
+    const [id, data] = r
+    if (stampOf(data) >= stampOf(next.get(id))) next.set(id, data)
+    if (data?.refreshing) pending = true
+  }
+  liveMap.value = next
+
+  // 服务端还在后台拉 → 稍后自动补拉，最多 3 轮（避免远端异常时无限轮询）
+  if (pending && !force && settleRounds < 3) {
+    settleRounds++
+    clearTimeout(settleTimer)
+    settleTimer = setTimeout(() => { loadLives() }, 1800)
+  }
+}
+
+function manualRefresh() {
+  settleRounds = 0
+  loadLives({ force: true })
+}
+
+watch(state, () => seedFromState())
+
+onMounted(async () => {
+  seedFromState()      // 首屏：用上次已知状态立即渲染，零等待
+  await refresh()      // 拉本地 state（很快，不发远端请求）
+  seedFromState()
+  loadLives()          // 后台静默刷新
+})
+
+onUnmounted(() => clearTimeout(settleTimer))
 
 async function doRunAll() {
   runningAll.value = true
@@ -114,7 +172,9 @@ async function doRunAll() {
     const fail = r.results.filter((x) => !x.ok).length
     toast(fail ? `一键签到完成，${fail} 个失败` : `全部 ${r.results.length} 个平台签到成功 ✅`, fail ? 'err' : 'ok')
     await refresh()
-    await loadLives()
+    seedFromState()
+    settleRounds = 0
+    loadLives({ force: true })
   } catch (e) { toast(e.message, 'err') }
   runningAll.value = false
 }
@@ -126,7 +186,9 @@ async function runOne(p) {
     const res = r.results?.[0]
     toast(`${p.name}：${res?.message || '完成'}`, res?.ok ? 'ok' : 'err')
     await refresh()
-    await loadLives()
+    seedFromState()
+    settleRounds = 0
+    loadLives({ force: true })
   } catch (e) { toast(e.message, 'err') }
   runningId.value = null
 }
@@ -150,7 +212,8 @@ function goTasks() { router.push('/tasks') }
         </div>
       </div>
       <div class="right">
-        <button class="btn" @click="refresh(); loadLives()">刷新</button>
+        <span v-if="syncing" class="sync-hint">更新中…</span>
+        <button class="btn" @click="manualRefresh">刷新</button>
         <button class="btn primary" :disabled="runningAll" @click="doRunAll">
           {{ runningAll ? '签到中…' : '一键签到' }}
         </button>

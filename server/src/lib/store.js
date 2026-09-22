@@ -4,7 +4,7 @@ import path from 'node:path';
 import { uid } from './util.js';
 import { AGREEMENT_REVISION } from './agreement.js';
 
-export const VERSION = '1.0.5';
+export const VERSION = '1.0.6';
 const CONFIG_DIR = process.env.CONFIG_DIR || path.join(process.cwd(), 'config_data');
 
 export function configDir() { return CONFIG_DIR; }

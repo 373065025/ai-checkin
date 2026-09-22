@@ -42,11 +42,21 @@ AI签到管家是一个跑在**飞牛 fnOS**（或任意 Linux + Node 18+）上�
 - **每日自动签到**：先查后签，已签自动跳过（接口幂等，不会重复发奖）
 - **派猫猫旅行闭环**：到达先领积分 → 再自动派遣；到每日派遣上限自动停手
 - **成长计划只读展示**：当前 Buddy、成长等级进度、待完成任务清单
-- **总览实时看板**：积分余额、连续登录天数、本周 / 本月活跃、连续奖励节点
 
 ### 通用 HTTP 签到（适配其他 AI 站点）
 浏览器里 F12 → 右键签到请求「复制为 cURL」→ 粘贴导入，自动解析 URL / 方法 / 请求头 / 请求体。
 成功判定支持四种：HTTP 状态码、响应包含文本、JSON 字段等于值、2xx 即成功。
+
+### 总览实时看板
+- 积分余额、连续签到天数、本月打卡天数、旅行状态、今日签到进度一目了然
+- **打开即显示，不再等待**：后端把上次已知状态随 `/api/state` 一起下发，首屏立刻渲染；
+  远端数据在后台并行拉取（7 个请求并行而非串行）并在完成后静默回填，页面全程可直接操作
+
+### 配置备份与恢复
+- 设置页「备份与恢复」可把任务、登录态、通知渠道、定时策略导出为一个 JSON 文件
+- 可选**是否包含登录凭据**：关闭后导出的配置可安全分享用于排查问题（恢复时不会覆盖本机已保存的登录态）
+- 导入备份会先展示「将导入多少任务、是否含登录态」再确认，避免误覆盖；恢复会立即落盘
+- 恢复范围：任务 / 通知 / 定时策略 / 自动检查更新；《用户协议》同意状态与版本更新源保持本机不变
 
 ### 定时与通知
 - 每个任务可配置多个每日执行时间点（默认 09:00），调度器每 30 秒检查一次
@@ -112,7 +122,7 @@ npm run release
 npm run smoke
 
 # 3. 提交并推送
-git add -A && git commit -m "release: 1.0.5" && git push origin main
+git add -A && git commit -m "release: <版本>" && git push origin main
 
 # 4. 创建 Release 并上传 build/app-<版本>.tgz + ai-checkin<版本>.fpk
 node tools/release.js --publish
@@ -127,7 +137,7 @@ node tools/release.js --publish --prune
 也可以打 tag 让 GitHub Actions 自动构建并发布（见 `.github/workflows/release.yml`）：
 
 ```bash
-git tag v1.0.5 && git push origin v1.0.5
+git tag v<版本> && git push origin v<版本>
 ```
 
 > 更新源默认即本仓库（`https://github.com/373065025/ai-checkin/releases/latest`），

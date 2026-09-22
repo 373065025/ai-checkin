@@ -4,9 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { VERSION, load, get, save, addLog, getLogs, clearLogs, configDir, isAgreementAccepted, getAgreementState, acceptAgreement, revokeAgreement } from './lib/store.js';
+import { VERSION, load, get, save, saveNow, addLog, getLogs, clearLogs, configDir, isAgreementAccepted, getAgreementState, acceptAgreement, revokeAgreement } from './lib/store.js';
 import { agreementPayload, AGREEMENT_REVISION } from './lib/agreement.js';
-import { runProvider, liveSnapshot } from './lib/providers.js';
+import { runProvider, liveSnapshot, readLive, slimLive } from './lib/providers.js';
 import { startScheduler } from './lib/scheduler.js';
 import { sendNotify } from './lib/notify.js';
 import { maskToken, uid, tryJson, parseCurl, nowText } from './lib/util.js';
@@ -40,6 +40,17 @@ function json(res, code, obj) {
   res.end(body);
 }
 
+/** 以附件形式下发 JSON（用于导出备份） */
+function jsonDownload(res, filename, obj) {
+  const body = JSON.stringify(obj, null, 2);
+  res.writeHead(200, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Content-Disposition': `attachment; filename="${filename}"`,
+    'Cache-Control': 'no-store',
+  });
+  res.end(body);
+}
+
 function readBody(req, limit = 2 * 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let size = 0;
@@ -68,7 +79,154 @@ function maskProvider(p) {
     out.tokenPresent = !!p.token;
     delete out.token;
   }
+  // 带上「上次已知的实时快照」：签到中心首屏即可渲染状态，不必先等远端
+  // 内存缓存优先（最新），其次用上次持久化的精简值（重启后依然秒开）
+  const live = readLive(p.id);
+  if (live) out.lastLive = { ...slimLive(live, live.at), age: live.age, fresh: live.fresh };
   return out;
+}
+
+// ---------- 配置备份与恢复 ----------
+
+const BACKUP_KIND = 'ai-checkin-backup';
+const NOTIFY_FORMATS = ['generic', 'dingtalk', 'feishu', 'wecom', 'bark', 'pushplus'];
+const MAX_BACKUP_PROVIDERS = 50;
+
+/** 生成备份对象。secrets=false 时不导出凭据，便于把配置发给别人排查 */
+function buildBackup(secrets) {
+  const s = get();
+  const providers = s.providers.map((p) => {
+    const c = { ...p };
+    delete c.lastRun;   // 运行期状态不进备份
+    delete c.lastLive;
+    if (!secrets && c.token) c.token = '';
+    return c;
+  });
+  return {
+    kind: BACKUP_KIND,
+    app: 'ai-checkin',
+    version: VERSION,
+    exportedAt: nowText(),
+    includesSecrets: !!secrets,
+    settings: {
+      providers,
+      notify: secrets ? { ...s.notify } : { ...s.notify, url: '' },
+      scheduler: { ...s.scheduler },
+      update: { autoCheck: s.update?.autoCheck !== false },
+    },
+    // 明确写出「恢复时不会覆盖什么」，避免用户以为换机后连同意状态也一起带过去
+    restoreScope: '恢复时会应用：任务（含登录态）、通知配置、定时策略、自动检查更新开关；'
+      + '协议同意状态与版本更新源保持本机设置不变。',
+  };
+}
+
+const str = (v, max = 200) => (typeof v === 'string' ? v.slice(0, max) : '');
+const bool = (v, dflt = true) => (typeof v === 'boolean' ? v : dflt);
+
+/** 校验并净化备份里的任务列表；token 为空表示「保留本机现有登录态」 */
+function sanitizeProviders(list, existing) {
+  const out = [];
+  const usedIds = new Set();
+  for (const raw of list) {
+    if (!raw || typeof raw !== 'object') continue;
+    const type = raw.type === 'workbuddy' ? 'workbuddy' : 'http';
+    let id = str(raw.id, 40);
+    if (!id || usedIds.has(id)) id = uid();
+    usedIds.add(id);
+
+    const prev = existing.find((x) => x.id === id)
+      || (type === 'workbuddy' ? existing.find((x) => x.type === 'workbuddy') : null);
+
+    const base = {
+      id,
+      type,
+      name: str(raw.name, 60) || (type === 'workbuddy' ? 'WorkBuddy 加油站' : '未命名任务'),
+      enabled: bool(raw.enabled, true),
+      schedule: {
+        times: Array.isArray(raw.schedule?.times)
+          ? raw.schedule.times.filter((t) => /^\d{1,2}:\d{2}$/.test(String(t))).slice(0, 12)
+          : ['09:00'],
+      },
+      lastRun: prev?.lastRun || null,
+      lastLive: prev?.lastLive || null,
+    };
+    if (!base.schedule.times.length) base.schedule.times = ['09:00'];
+
+    if (type === 'workbuddy') {
+      const token = str(raw.token, 8192);
+      out.push({
+        ...base,
+        // 空 token → 保留本机现有登录态（导入「不含凭据」的备份时不会把凭据清掉）
+        token: token || prev?.token || '',
+        domain: str(raw.domain, 120) || prev?.domain || 'www.codebuddy.cn',
+        autoCheckin: bool(raw.autoCheckin, true),
+        travelAuto: bool(raw.travelAuto, true),
+        locationId: Number.isFinite(Number(raw.locationId)) ? Number(raw.locationId) : 0,
+      });
+    } else {
+      const h = raw.http || {};
+      out.push({
+        ...base,
+        http: {
+          url: str(h.url, 2000),
+          method: str(h.method, 10).toUpperCase() || 'GET',
+          headers: (h.headers && typeof h.headers === 'object' && !Array.isArray(h.headers))
+            ? Object.fromEntries(Object.entries(h.headers).slice(0, 30).map(([k, v]) => [str(k, 200), str(v, 2000)]))
+            : {},
+          body: str(h.body, 20000),
+          successRule: {
+            kind: ['status', 'contains', 'json', 'always'].includes(h.successRule?.kind) ? h.successRule.kind : 'status',
+            expr: str(h.successRule?.expr, 200) || '200',
+            value: str(h.successRule?.value, 200),
+          },
+        },
+      });
+    }
+    if (out.length >= MAX_BACKUP_PROVIDERS) break;
+  }
+  return out;
+}
+
+/** 解析备份文件 → { ok, error?, settings?, summary? } */
+function parseBackup(input) {
+  const data = input && typeof input === 'object' ? input : null;
+  if (!data) return { ok: false, error: '备份内容不是有效的 JSON 对象' };
+  const settings = data.settings && typeof data.settings === 'object' ? data.settings : null;
+  if (!settings) return { ok: false, error: '备份文件缺少 settings 字段，可能不是本应用导出的备份' };
+  if (data.app && data.app !== 'ai-checkin') return { ok: false, error: `备份来自其它应用（${data.app}），已拒绝导入` };
+  if (!Array.isArray(settings.providers)) return { ok: false, error: '备份里的 providers 不是数组，文件可能已损坏' };
+
+  const s = get();
+  const providers = sanitizeProviders(settings.providers, s.providers);
+  if (!providers.some((p) => p.type === 'workbuddy')) {
+    return { ok: false, error: '备份里没有 WorkBuddy 任务，已拒绝导入（避免清空内置任务）' };
+  }
+
+  const rawNotify = settings.notify && typeof settings.notify === 'object' ? settings.notify : null;
+  const notify = rawNotify
+    ? {
+        enabled: bool(rawNotify.enabled, false),
+        format: NOTIFY_FORMATS.includes(rawNotify.format) ? rawNotify.format : 'generic',
+        // 空值 → 保留本机现有推送地址
+        url: str(rawNotify.url, 2000) || s.notify?.url || '',
+      }
+    : null;
+
+  return {
+    ok: true,
+    providers,
+    notify,
+    scheduler: settings.scheduler && typeof settings.scheduler === 'object'
+      ? { runOnStart: bool(settings.scheduler.runOnStart, true) }
+      : null,
+    updateAutoCheck: typeof settings.update?.autoCheck === 'boolean' ? settings.update.autoCheck : null,
+    meta: {
+      app: data.app || '',
+      version: str(data.version, 30),
+      exportedAt: str(data.exportedAt, 40),
+      includesSecrets: !!data.includesSecrets,
+    },
+  };
 }
 
 // ---------- API 路由 ----------
@@ -81,7 +239,7 @@ async function handleApi(req, res, url) {
   }
 
   // 「同意才能使用」：未同意用户协议前，后端拒绝一切实际执行动作（不只是前端遮挡）
-  const AGREEMENT_GUARDED = ['/api/providers/run', '/api/run-all', '/api/notify/test'];
+  const AGREEMENT_GUARDED = ['/api/providers/run', '/api/run-all', '/api/notify/test', '/api/backup/restore'];
   if (req.method === 'POST' && AGREEMENT_GUARDED.includes(p) && !isAgreementAccepted()) {
     return json(res, 403, {
       ok: false,
@@ -238,11 +396,13 @@ async function handleApi(req, res, url) {
   }
 
   // 按任务 ID 取实时快照（只读）
+  // - 默认：有缓存立刻返回（过期则顺手后台刷新），页面无需等待
+  // - body.force=true：强制拉一次最新并等待（用户主动点「刷新」）
   if (req.method === 'POST' && p === '/api/providers/live') {
     const body = await readJson(req);
     const prov = s.providers.find((x) => x.id === body.id);
     if (!prov) return json(res, 404, { ok: false, message: '任务不存在' });
-    return json(res, 200, await liveSnapshot(prov));
+    return json(res, 200, await liveSnapshot(prov, { force: !!body.force }));
   }
 
   if (req.method === 'POST' && p === '/api/curl-parse') {
@@ -261,6 +421,52 @@ async function handleApi(req, res, url) {
   if (req.method === 'POST' && p === '/api/logs/clear') {
     clearLogs();
     return json(res, 200, { ok: true });
+  }
+
+  // ===== 配置备份与恢复 =====
+  // 导出：GET /api/backup/export?secrets=0|1
+  if (req.method === 'GET' && p === '/api/backup/export') {
+    const secrets = url.searchParams.get('secrets') !== '0';
+    const stamp = nowText().replace(/[^0-9]/g, '').slice(0, 12);
+    return jsonDownload(res, `ai-checkin-backup-${stamp}.json`, buildBackup(secrets));
+  }
+
+  // 恢复：POST /api/backup/restore  { backup, confirm }
+  // confirm !== true 时只做校验与预览，不落盘（前端弹窗二次确认后再真正应用）
+  if (req.method === 'POST' && p === '/api/backup/restore') {
+    const body = await readJson(req);
+    const parsed = parseBackup(body.backup ?? body.data ?? body);
+    if (!parsed.ok) return json(res, 400, { ok: false, message: parsed.error });
+
+    const summary = {
+      providers: parsed.providers.length,
+      workbuddy: parsed.providers.filter((x) => x.type === 'workbuddy').length,
+      http: parsed.providers.filter((x) => x.type === 'http').length,
+      enabled: parsed.providers.filter((x) => x.enabled).length,
+      withToken: parsed.providers.filter((x) => x.type === 'workbuddy' && x.token).length,
+      notify: parsed.notify ? parsed.notify.format : null,
+      scheduler: parsed.scheduler,
+      updateAutoCheck: parsed.updateAutoCheck,
+      meta: parsed.meta,
+    };
+
+    if (body.confirm !== true) {
+      return json(res, 200, { ok: true, preview: true, summary, scope: buildBackup(false).restoreScope });
+    }
+
+    s.providers = parsed.providers;
+    if (parsed.notify) s.notify = parsed.notify;
+    if (parsed.scheduler) s.scheduler = { ...s.scheduler, ...parsed.scheduler };
+    if (parsed.updateAutoCheck !== null) s.update = { ...s.update, autoCheck: parsed.updateAutoCheck };
+    saveNow(); // 立即落盘：避免重启后配置回退
+    addLog({
+      providerName: '系统',
+      trigger: 'manual',
+      ok: true,
+      message: `已恢复配置备份（任务 ${summary.providers} 个，含登录态 ${summary.withToken} 个）`,
+      durationMs: 0,
+    });
+    return json(res, 200, { ok: true, applied: summary, providers: s.providers.map(maskProvider) });
   }
 
   // ===== 系统 / 自动更新 =====

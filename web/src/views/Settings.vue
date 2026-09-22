@@ -1,6 +1,6 @@
 <script setup>
 import { ref, inject, computed, onMounted, onUnmounted } from 'vue'
-import { saveSettings, testNotify, getSystemInfo, getUpdateInfo, checkUpdate, getUpdateStatus, getUpdateBackups, applyUpdate, rollbackUpdate, saveUpdateConfig, fmtTime } from '../api/index.js'
+import { saveSettings, testNotify, getSystemInfo, getUpdateInfo, checkUpdate, getUpdateStatus, getUpdateBackups, applyUpdate, rollbackUpdate, saveUpdateConfig, fmtTime, backupExportUrl, previewRestore, applyRestore } from '../api/index.js'
 
 const state = inject('state')
 const refresh = inject('refresh')
@@ -149,6 +149,55 @@ function flashSaved() {
   savedTimer.value = setTimeout(() => { saved.value = false }, 2000)
 }
 
+// ===== 备份与恢复 =====
+const backupSecrets = ref(true)     // 导出时是否包含登录凭据
+const backupBusy = ref(false)
+const backupPreview = ref(null)     // { raw, summary, scope, fileName }
+const backupInput = ref(null)
+
+function exportBackup() {
+  // 走浏览器原生下载：后端以 attachment 响应，文件名由后端给
+  const a = document.createElement('a')
+  a.href = backupExportUrl(backupSecrets.value)
+  a.rel = 'noopener'
+  document.body.appendChild(a)
+  a.click()
+  a.remove()
+  toast(backupSecrets.value
+    ? '已导出完整备份（含登录态，请妥善保管）'
+    : '已导出配置备份（不含登录凭据，可安全分享）')
+}
+
+async function onPickBackup(e) {
+  const f = e.target.files?.[0]
+  e.target.value = '' // 允许重复选择同一个文件
+  if (!f) return
+  backupBusy.value = true
+  try {
+    const text = await f.text()
+    let parsed
+    try { parsed = JSON.parse(text) } catch { throw new Error('文件不是有效的 JSON，请选择本应用导出的备份文件') }
+    const r = await previewRestore(parsed)
+    backupPreview.value = { raw: parsed, summary: r.summary, scope: r.scope, fileName: f.name }
+  } catch (err) {
+    toast(err.message, 'err')
+  }
+  backupBusy.value = false
+}
+
+async function confirmRestore() {
+  const p = backupPreview.value
+  if (!p) return
+  backupBusy.value = true
+  try {
+    await applyRestore(p.raw)
+    backupPreview.value = null
+    await refresh()
+    toast('配置已恢复 ✅')
+  } catch (e) { toast(e.message, 'err') }
+  backupBusy.value = false
+}
+
 let pollTimer = null
 onMounted(async () => {
   await loadSystemInfo()
@@ -214,6 +263,33 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
       <div class="hint">
         配置目录：<code>{{ state.configDir }}</code>（settings.json 存任务与凭据，logs.json 存日志）<br />
         所有凭据只保存在 NAS 本机配置目录，Web 界面仅显示掩码、日志中永不出现；后端只调用各平台已验证的写入接口，不做兑换、抽奖等操作。
+      </div>
+    </div>
+
+    <div class="panel">
+      <h3>备份与恢复</h3>
+      <div class="hint" style="margin-bottom:12px">
+        把任务、登录态、通知渠道与定时策略导出成一个 JSON 文件；换机器或重装应用后，导入该文件即可一键恢复。
+      </div>
+      <div class="inline" style="margin-bottom:12px">
+        <label class="switch"><input type="checkbox" v-model="backupSecrets" /><span class="track"></span></label>
+        <span style="font-size:13.5px">
+          导出时包含登录凭据{{ backupSecrets ? '' : '（已关闭，恢复时不会覆盖本机已保存的登录态）' }}
+        </span>
+      </div>
+      <div v-if="backupSecrets" class="hint" style="margin-bottom:12px">
+        ⚠️ 备份文件里含有 WorkBuddy 登录态，等同于账号凭证，请勿发送给他人或上传到公开位置。
+      </div>
+      <div class="inline">
+        <button class="btn primary" @click="exportBackup">导出备份</button>
+        <button class="btn" :disabled="backupBusy" @click="backupInput.click()">
+          {{ backupBusy ? '处理中…' : '导入备份恢复' }}
+        </button>
+        <input ref="backupInput" type="file" accept="application/json,.json" style="display:none" @change="onPickBackup" />
+      </div>
+      <div class="hint" style="margin-top:10px">
+        恢复时会应用：任务（含登录态）、通知配置、定时策略、自动检查更新开关；
+        《用户协议》的同意状态与版本更新源保持本机设置不变。
       </div>
     </div>
 
@@ -308,6 +384,44 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
               <button class="btn small" v-if="canClose" @click="showUpdate = false">稍后</button>
               <button class="btn small primary" :disabled="!canClose" @click="startUpdate">
                 {{ upState.state === 'idle' ? '下载并更新' : '更新中…' }}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </transition>
+
+    <!-- 恢复备份确认弹窗（先展示将要导入的内容，确认后才落盘） -->
+    <transition name="fade">
+      <div v-if="backupPreview" class="modal-mask" @click.self="backupPreview = null">
+        <div class="modal-panel" style="max-width: 520px">
+          <div class="modal-header">
+            <h3 class="modal-title">恢复配置备份</h3>
+            <button class="modal-close" @click="backupPreview = null">✕</button>
+          </div>
+          <div class="modal-body">
+            <div class="up-meta">
+              <span class="chip">{{ backupPreview.fileName }}</span>
+              <span v-if="backupPreview.summary.meta?.version" class="chip">v{{ backupPreview.summary.meta.version }}</span>
+              <span v-if="backupPreview.summary.meta?.exportedAt" class="chip">导出于 {{ backupPreview.summary.meta.exportedAt }}</span>
+            </div>
+            <div class="up-notes">
+              <div>任务：共 <b>{{ backupPreview.summary.providers }}</b> 个
+                （WorkBuddy {{ backupPreview.summary.workbuddy }} 个 / HTTP {{ backupPreview.summary.http }} 个，
+                启用 {{ backupPreview.summary.enabled }} 个）</div>
+              <div>含登录态的任务：<b>{{ backupPreview.summary.withToken }}</b> 个{{ backupPreview.summary.withToken ? '' : '（将沿用本机已保存的登录态）' }}</div>
+              <div v-if="backupPreview.summary.notify">通知渠道：<b>{{ backupPreview.summary.notify }}</b></div>
+            </div>
+            <p class="up-tip">
+              恢复会<b>覆盖当前的签到任务与通知配置</b>。{{ backupPreview.scope }}
+            </p>
+          </div>
+          <div class="modal-foot">
+            <span class="foot-note">覆盖前建议先导出一份当前配置</span>
+            <div class="foot-actions">
+              <button class="btn small" :disabled="backupBusy" @click="backupPreview = null">取消</button>
+              <button class="btn small primary" :disabled="backupBusy" @click="confirmRestore">
+                {{ backupBusy ? '恢复中…' : '确认恢复' }}
               </button>
             </div>
           </div>

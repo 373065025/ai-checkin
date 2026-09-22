@@ -1,4 +1,4 @@
-const VERSION = 'v1.0.5'
+const VERSION = 'v1.0.6'
 
 export async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -23,7 +23,9 @@ export const testNotify = (content) => api('/api/notify/test', { method: 'POST',
 export const clearLogs = () => api('/api/logs/clear', { method: 'POST', body: '{}' })
 export const getWbLive = () => api('/api/wb/live')
 
-export const getProviderLive = (id) => api('/api/providers/live', { method: 'POST', body: JSON.stringify({ id }) })
+// force=true 强制拉最新（用户点「刷新」）；默认拿缓存、过期则后台刷新，页面不等待
+export const getProviderLive = (id, force = false) =>
+  api('/api/providers/live', { method: 'POST', body: JSON.stringify({ id, force }) })
 
 // ===== 系统 / 自动更新 =====
 export const getSystemInfo = () => api('/api/system/info')
@@ -39,6 +41,12 @@ export const saveUpdateConfig = (patch) => api('/api/system/update/config', { me
 export const getAgreement = () => api('/api/agreement')
 export const acceptAgreement = () => api('/api/agreement/accept', { method: 'POST', body: '{}' })
 export const revokeAgreement = () => api('/api/agreement/revoke', { method: 'POST', body: '{}' })
+
+// ===== 配置备份与恢复 =====
+// 导出走浏览器原生下载（附件响应），secrets=false 时不带登录凭据，便于分享排查
+export const backupExportUrl = (secrets = true) => `/api/backup/export?secrets=${secrets ? 1 : 0}`
+export const previewRestore = (backup) => api('/api/backup/restore', { method: 'POST', body: JSON.stringify({ backup }) })
+export const applyRestore = (backup) => api('/api/backup/restore', { method: 'POST', body: JSON.stringify({ backup, confirm: true }) })
 
 export { VERSION }
 
