@@ -35,6 +35,9 @@ jobs:
       - name: 生成安装包 fpk
         run: node tools/build-fpk.js
 
+      - name: 校验 fpk 结构
+        run: node tools/verify-fpk.js
+
       - name: 上传构建产物（供下载查看）
         uses: actions/upload-artifact@v4
         with:

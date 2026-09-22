@@ -51,7 +51,8 @@ AI签到管家是一个跑在**飞牛 fnOS**（或任意 Linux + Node 18+）上�
 ### 定时与通知
 - 每个任务可配置多个每日执行时间点（默认 09:00），调度器每 30 秒检查一次
 - 开启「启动补跑」后，NAS / 应用重启时会补跑当天没跑过的任务
-- 结果可推送到 通用 Webhook / 钉钉 / 飞书 / 企业微信 / Bark
+- 结果可推送到 通用 Webhook / 钉钉 / 飞书 / 企业微信 / Bark / **PushPlus（微信公众号）**
+- PushPlus 的 Token 栏可直接粘贴裸 token，也可粘贴手机端复制的整条 `send?token=...&topic=...` 地址，会自动解析
 
 ### 版本更新
 - 设置页「版本更新」卡片：一键检查 / 下载 / 更新 / 回滚
@@ -101,25 +102,32 @@ https://github.com/373065025/ai-checkin/releases/latest
 - 发现新版本 → 弹窗确认 → 自动备份当前版本（可回滚）→ 下载 → 校验 SHA256 → 热替换 → 自动重启
 - 更新源固定在项目仓库，设置页只读展示；GitHub 未登录时 API 限 60 次/小时（对 6 小时一次的检查完全够用）
 
-**发布新版本时**，只需在 GitHub 建一个 Release，附上更新包：
+**发布新版本时**（版本号以根目录 `manifest` 的 `version` 为准）：
 
 ```bash
-# 1. 构建前端
-npm --prefix web install
-npm --prefix web run build
+# 1. 构建前端 + 生成热更新包与安装包，并自动校验 fpk
+npm run release
 
-# 2. 生成更新包（app-<版本>.tgz）与安装包（.fpk）
-node tools/build-app-tgz.js
-node tools/build-fpk.js
+# 2. 解包真跑一遍，确认版本号与协议门禁正常（可选但推荐）
+npm run smoke
 
-# 3. 在 GitHub 上传 build/app-<版本>.tgz（Release 附件）
-#    也可直接上传 .fpk，客户端会自动拆出里面的 app.tgz
+# 3. 提交并推送
+git add -A && git commit -m "release: 1.0.5" && git push origin main
+
+# 4. 创建 Release 并上传 build/app-<版本>.tgz + ai-checkin<版本>.fpk
+node tools/release.js --publish
+
+#    加 --prune 可在发布后删除其它旧 Release，只保留最新版本
+node tools/release.js --publish --prune
 ```
+
+`tools/release.js` 不带参数时是只读检查（列出当前所有 Release），凭据优先读环境变量
+`GH_TOKEN` / `GITHUB_TOKEN`，否则复用本机已保存的 git 凭据。
 
 也可以打 tag 让 GitHub Actions 自动构建并发布（见 `.github/workflows/release.yml`）：
 
 ```bash
-git tag v1.0.4 && git push origin v1.0.4
+git tag v1.0.5 && git push origin v1.0.5
 ```
 
 > 更新源默认即本仓库（`https://github.com/373065025/ai-checkin/releases/latest`），
@@ -138,12 +146,19 @@ git tag v1.0.4 && git push origin v1.0.4
 ├── ui/                      # 桌面入口：ui/config + ui/images/icon-{64,256}.png
 ├── ICON.PNG  ICON_256.PNG   # 应用中心图标
 ├── server/                  # 零依赖后端（node:http，无 node_modules）
-│   └── src/lib/updater.js   #   应用内自动更新（GitHub Releases / 自定义源）
+│   └── src/lib/
+│       ├── agreement.js     #   用户协议与免责声明全文（条款版本在此维护）
+│       ├── notify.js        #   通知通道（Webhook / 钉钉 / 飞书 / 企微 / Bark / PushPlus）
+│       └── updater.js       #   应用内自动更新（GitHub Releases / 自定义源）
 ├── web/                     # Vue3 + Vite 前端（构建产物 web/dist）
-└── tools/                   # 零依赖打包工具（Windows 也能跑）
+└── tools/                   # 零依赖工具链（Windows 也能跑）
     ├── build-app-tgz.js     #   生成 app-<版本>.tgz（热更新包）
     ├── build-fpk.js         #   生成 ai-checkin<版本>.fpk（安装包）
-    └── lib/tar-pack.js      #   自写 tar + gzip
+    ├── verify-fpk.js        #   校验 fpk 成员 / cmd 执行位 / manifest / 内层 app.tgz
+    ├── smoke-package.js     #   解包真跑，验证版本号与协议门禁
+    ├── release.js           #   发布 GitHub Release（--publish / --prune）
+    ├── lib/tar-pack.js      #   自写 tar + gzip（打包）
+    └── lib/tar-read.js      #   自写 tar 读取（校验，支持 PAX 长路径）
 ```
 
 ## 本地开发
@@ -163,7 +178,9 @@ node server/src/index.js        # 默认端口 8630，可用 PORT 覆盖
 npm run build          # 构建前端
 npm run update:tgz     # 生成热更新包
 npm run fpk            # 生成安装包
-npm run release        # 一条龙：build + tgz + fpk
+npm run verify         # 校验 fpk 结构（成员 / 执行位 / manifest / 内层包）
+npm run smoke          # 解包真跑，验证版本号与协议门禁
+npm run release        # 一条龙：build + tgz + fpk + verify 校验
 ```
 
 ## 安全说明
