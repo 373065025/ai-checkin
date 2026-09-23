@@ -145,7 +145,11 @@ function assetFiles() {
 
 async function uploadAsset(release, file) {
   const name = path.basename(file);
-  const existing = (release.assets || []).find((a) => a.name === name);
+  // ⚠️ 不能信 release.assets —— releases 列表/详情端点有时把 assets 返回成空数组
+  // （实测：列表说 0 个、assets 专用端点说 2 个）。必须以专用端点为准，
+  // 否则同名旧附件删不掉，会留下两份同名资产。
+  const current = await api('GET', `/repos/${owner}/${repo}/releases/${release.id}/assets?per_page=100`);
+  const existing = (Array.isArray(current) ? current : []).find((a) => a.name === name);
   if (existing) {
     await api('DELETE', `/repos/${owner}/${repo}/releases/assets/${existing.id}`);
     console.log(`  · 已删除同名旧附件 ${name}`);

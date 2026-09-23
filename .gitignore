@@ -17,6 +17,7 @@ app/
 
 # 本地临时 / 开发脚本
 _*.py
+_*.mjs
 _build.mjs
 _shots/
 _smoke*

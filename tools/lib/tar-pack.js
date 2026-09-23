@@ -87,13 +87,25 @@ export async function packTar(entries) {
   return Buffer.concat(chunks);
 }
 
-/** gzip 压缩 */
+/**
+ * gzip 压缩。
+ *
+ * 注意末尾那 1 个字节的修补：Node 的 zlib 会把 gzip 头的 **OS 字段（第 10 字节）**
+ * 按当前平台写入（Windows 0x0a / Linux 0x03 …）。这会让「本机 Windows 打的包」
+ * 与「GitHub Actions 在 ubuntu 上打的包」即使内容完全相同、sha256 也对不上
+ * （实测两份包长度一模一样、解压后 tar 逐字节相同，只差这一个字节）。
+ * 统一写成 0x03（Unix）后，跨平台构建即可产出完全相同的字节。
+ */
 export function gzip(buf, level = 9) {
   return new Promise((resolve, reject) => {
     const parts = [];
     createGzip({ level })
       .on('data', (c) => parts.push(c))
-      .on('end', () => resolve(Buffer.concat(parts)))
+      .on('end', () => {
+        const out = Buffer.concat(parts);
+        if (out.length > 9 && out[0] === 0x1f && out[1] === 0x8b) out[9] = 0x03; // OS = Unix
+        resolve(out);
+      })
       .on('error', reject)
       .end(buf);
   });
