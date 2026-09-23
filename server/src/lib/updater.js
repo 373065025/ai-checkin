@@ -162,6 +162,180 @@ function normalizeGitHub(url) {
   return u.replace(/github\.com/i, 'api.github.com');
 }
 
+/** 从各种 GitHub 形式里解析出 { owner, repo }（用于走免配额的公开页面通道） */
+function parseGitHubRepo(url) {
+  const u = String(url || '').trim();
+  let m = u.match(/api\.github\.com\/repos\/([^/]+)\/([^/?#]+)/i);
+  if (m) return { owner: m[1], repo: m[2].replace(/\.git$/, '') };
+  m = u.match(/github\.com\/([^/]+)\/([^/?#]+)/i);
+  if (m && !['repos', 'orgs', 'users', 'login'].includes(m[1].toLowerCase())) {
+    return { owner: m[1], repo: m[2].replace(/\.git$/, '') };
+  }
+  return null;
+}
+
+function decodeXml(s) {
+  return String(s || '')
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;|&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, d) => String.fromCharCode(Number(d)))
+    .replace(/&amp;/g, '&');
+}
+
+function stripHtml(s) {
+  return String(s || '')
+    .replace(/<\s*(script|style)[^>]*>[\s\S]*?<\s*\/\s*\1\s*>/gi, ' ')
+    .replace(/<\s*br\s*\/?\s*>/gi, '\n')
+    .replace(/<\s*\/\s*(p|div|li|h[1-6])\s*>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/[ \t]{2,}/g, ' ')
+    .trim();
+}
+
+/**
+ * 免配额的「公开页面」通道——**完全不消耗 api.github.com 的 60 次/小时匿名配额**。
+ *
+ * 为什么必须要有它：api.github.com 对未认证请求按 **出口 IP** 限流（60 次/小时），
+ * 国内 NAS 常位于运营商 NAT / 共享出口之下，很容易被别人用光；一旦 403，
+ * 旧逻辑只会报「检查失败」，用户既看不到新版本、也不知道为什么。
+ *
+ * 用到的三个免配额端点（实测在配额 0/60 时全部正常）：
+ *   1. https://github.com/<o>/<r>/releases/latest   → 302 跳到 /releases/tag/<tag>，拿版本号
+ *   2. https://github.com/<o>/<r>/releases.atom     → 拿 tag / 发布时间 / 更新说明
+ *   3. https://github.com/<o>/<r>/releases/download/v<ver>/<asset> 的 HEAD → 拿大小、判断资产是否存在
+ * 注意：这条通道拿不到 GitHub 的 sha256（digest），所以完整性校验收窄为「文件大小一致」。
+ */
+async function latestTagViaRedirect(root, timeout = 12000) {
+  const url = `${root}/releases/latest`;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    // redirect:'manual' —— 自己读 Location，避免跟到 tag 页面去下载整个 HTML
+    const resp = await fetch(url, {
+      headers: { 'User-Agent': 'ai-checkin' },
+      redirect: 'manual',
+      signal: ctrl.signal,
+    });
+    const loc = resp.headers.get('location') || '';
+    const m = loc.match(/\/releases\/tag\/([^/?#]+)/) || String(resp.url || '').match(/\/releases\/tag\/([^/?#]+)/);
+    return m ? decodeURIComponent(m[1]).replace(/^v/, '') : '';
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 解析 releases.atom，返回最近若干条 { version, notes, publishedAt } */
+async function releasesFromAtom(root, timeout = 12000) {
+  const url = `${root}/releases.atom`;
+  const { status, text } = await fetchText(url, { timeout });
+  if (status < 200 || status >= 300) throw new Error(`atom 订阅源返回 HTTP ${status}`);
+  const entries = [...String(text).matchAll(/<entry>([\s\S]*?)<\/entry>/gi)].map((m) => m[1]);
+  const out = [];
+  for (const e of entries.slice(0, 8)) {
+    // tag 优先取 <link rel="alternate" ... href=".../releases/tag/xxx">
+    let tag = '';
+    const lm = e.match(/<link[^>]+href="[^"]*\/releases\/tag\/([^"?#]+)"/i);
+    if (lm) tag = lm[1];
+    if (!tag) {
+      const im = e.match(/<id>[^<]*\/([^/<]+)<\/id>/i);
+      if (im) tag = im[1];
+    }
+    if (!tag) {
+      const tm = e.match(/<title>([\s\S]*?)<\/title>/i);
+      if (tm) tag = decodeXml(stripHtml(tm[1]));
+    }
+    tag = decodeXml(tag).trim();
+    if (!tag) continue;
+    const content = (e.match(/<content[^>]*>([\s\S]*?)<\/content>/i) || [])[1] || '';
+    const updated = (e.match(/<updated>([^<]+)<\/updated>/i) || [])[1] || '';
+    out.push({
+      version: tag.replace(/^v/, ''),
+      notes: stripHtml(decodeXml(content)).slice(0, 3000),
+      publishedAt: updated,
+    });
+  }
+  if (!out.length) throw new Error('atom 订阅源里没有任何 Release');
+  return out;
+}
+
+/** 按项目发布约定探测资产（HEAD，免配额）：app-<版本>.tgz 优先，其次 ai-checkin<版本>.fpk */
+async function probeGitHubAsset(root, version, timeout = 12000) {
+  const names = [`app-${version}.tgz`, `ai-checkin${version}.fpk`];
+  for (const name of names) {
+    const url = `${root}/releases/download/v${version}/${name}`;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeout);
+    try {
+      const resp = await fetch(url, {
+        method: 'HEAD',
+        headers: { 'User-Agent': 'ai-checkin' },
+        redirect: 'follow',
+        signal: ctrl.signal,
+      });
+      if (resp.ok) return { name, url, size: Number(resp.headers.get('content-length') || 0) };
+    } catch { /* 这个名字不存在或网络抖动 → 试下一个 */ } finally {
+      clearTimeout(timer);
+    }
+  }
+  return null;
+}
+
+/**
+ * 免配额通道的可选入口：直连 github.com，不通就依次换镜像。
+ * 实测国内网络里 github.com 的 HTML/重定向端点常被重置（ECONNRESET），
+ * 而 ghproxy / ghfast 这类镜像仍能给出 302 tag 与资产 HEAD —— 所以镜像必须算进来，
+ * 否则「API 限流 + github.com 不通」两个条件同时出现时就彻底查不到更新了。
+ */
+const PAGES_BASES = [
+  { label: '直连', prefix: '' },
+  ...GITHUB_MIRRORS.map((m) => ({ label: `镜像 ${m.label}`, prefix: m.prefix })),
+];
+
+async function pagesFrom(root, timeout = 12000) {
+  // 版本号：先问 302 重定向（最快），失败再用 atom 的首条
+  let version = '';
+  let notes = '';
+  let publishedAt = '';
+  try { version = await latestTagViaRedirect(root, timeout) } catch { /* 后面用 atom 兜底 */ }
+  if (!version) {
+    const list = await releasesFromAtom(root, timeout);
+    version = list[0].version;
+    notes = list[0].notes || '';
+    publishedAt = list[0].publishedAt || '';
+  }
+  if (!version) throw new Error('无法确定最新版本号');
+  const asset = await probeGitHubAsset(root, version, timeout);
+  if (!asset) {
+    throw new Error(`v${version} 里没找到 app-${version}.tgz 或 ai-checkin${version}.fpk`);
+  }
+  return {
+    version,
+    notes,
+    url: asset.url,
+    assetName: asset.name,
+    size: asset.size || 0,
+    sha256: '',            // 免配额通道拿不到 digest，改为按大小校验
+    publishedAt,
+    source: 'github',
+  };
+}
+
+async function fetchManifestViaPages(repo, timeout = 12000) {
+  const path = `https://github.com/${repo.owner}/${repo.repo}`;
+  const errors = [];
+  for (const base of PAGES_BASES) {
+    const root = base.prefix ? base.prefix + path : path;
+    try {
+      const man = await pagesFrom(root, timeout);
+      return { ...man, via: 'pages', pageBase: base.label };
+    } catch (err) {
+      errors.push(`${base.label}：${err.message}`);
+    }
+  }
+  throw new Error(errors.join('；') || '免配额通道不可用');
+}
+
 function isBuiltinHost(url) {
   try {
     const host = new URL(url).hostname.toLowerCase();
@@ -207,7 +381,14 @@ function resolveSources() {
     const u = (url || '').trim();
     if (!u || seen.has(u)) return;
     seen.add(u);
-    out.push({ url: normalizeGitHub(u), label, timeout, headers: authHeadersFor(u, s) });
+    out.push({
+      url: normalizeGitHub(u),
+      pageUrl: u,                 // 原始地址（保留 GitHub 仓库页形式，供免配额通道使用）
+      repo: parseGitHubRepo(u),   // { owner, repo }，非 GitHub 源为 null
+      label,
+      timeout,
+      headers: authHeadersFor(u, s),
+    });
   };
   add(s.url, '主更新源');
   add(s.altUrl, '备用更新源');
@@ -226,6 +407,36 @@ export function getUpdateSources() {
 
 // ===== 网络（Node 内置 fetch） =====
 
+/**
+ * 网络层瞬时错误（TLS 被重置、DNS 抖动、连接超时）在这个项目的实际部署环境里非常常见
+ * ——NAS 常年在运营商网络里，去 github.com 的连接说断就断。这类错误值得重试；
+ * 而「没有更新包」「404」这类逻辑错误重试多少次都一样，不该浪费用户时间。
+ */
+const TRANSIENT_CODES = new Set([
+  'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT', 'EAI_AGAIN', 'ENOTFOUND', 'EPIPE', 'ECONNABORTED',
+  'UND_ERR_CONNECT_TIMEOUT', 'UND_ERR_SOCKET', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT', 'UND_ERR_ABORTED',
+]);
+
+function isTransient(err) {
+  const code = (err && err.cause && (err.cause.code || err.cause.errno)) || (err && (err.code || err.errno)) || '';
+  if (TRANSIENT_CODES.has(code)) return true;
+  const msg = String((err && err.message) || '');
+  return /fetch failed|socket disconnected|TLS|ECONNRESET|aborted|network/i.test(msg);
+}
+
+/** 只对瞬时错误重试；次数用尽或遇到逻辑错误立刻抛出 */
+async function withRetry(fn, { attempts = 3, delay = 700 } = {}) {
+  let lastErr;
+  for (let i = 1; i <= attempts; i++) {
+    try { return await fn() } catch (err) {
+      lastErr = err;
+      if (i === attempts || !isTransient(err)) throw err;
+      await new Promise((r) => setTimeout(r, delay * i));
+    }
+  }
+  throw lastErr;
+}
+
 async function fetchText(url, { headers = {}, timeout = 15000, method = 'GET' } = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeout);
@@ -242,7 +453,7 @@ async function fetchText(url, { headers = {}, timeout = 15000, method = 'GET' } 
   }
 }
 
-async function fetchManifest(url, headers = {}, timeout = 15000) {
+async function fetchManifestViaApi(url, headers = {}, timeout = 15000) {
   const isGh = /api\.github\.com\/repos\/[^/]+\/[^/]+\/releases/.test(url);
   const { status, text } = await fetchText(url, {
     headers: { ...headers, Accept: isGh ? 'application/vnd.github+json' : 'application/json' },
@@ -256,7 +467,9 @@ async function fetchManifest(url, headers = {}, timeout = 15000) {
       : '更新清单不存在（404）—— 请检查更新源地址');
   }
   if (status === 401 || status === 403) {
-    throw new Error(`更新源拒绝访问（HTTP ${status}）${isGh ? '：私有仓库或触发限流时，请在「访问令牌」填入 GitHub Token' : '：请检查访问令牌 / 用户名密码'}`);
+    throw new Error(isGh
+      ? `GitHub API 拒绝访问（HTTP ${status}）—— 未认证请求按出口 IP 限流（60 次/小时），常见于共享网络的 NAS。`
+      : `更新源拒绝访问（HTTP ${status}）—— 请检查访问令牌 / 用户名密码`);
   }
   if (status < 200 || status >= 300) {
     throw new Error(`更新源返回 HTTP ${status}`);
@@ -267,7 +480,30 @@ async function fetchManifest(url, headers = {}, timeout = 15000) {
   if (!d || typeof d !== 'object') throw new Error('更新清单不是合法的 JSON');
 
   if (isGh) {
-    const assets = d.assets || [];
+    // 三种端点行为不一致（实测）：
+    //   /releases/latest        → 带 assets，且带 digest ✅
+    //   /releases（列表）        → 返回数组，且 assets 常被漏成 []
+    //   /releases/tags/<tag>    → assets 稳定为 [] ❌
+    // 旧代码只信 `d.assets`，遇到后两种会误判成「这个 Release 没有更新包」。
+    const rel = Array.isArray(d) ? d[0] : d;
+    if (!rel || !rel.tag_name) throw new Error('GitHub 返回里没有找到 Release 信息');
+    let assets = Array.isArray(rel.assets) ? rel.assets : [];
+    if (!assets.length && rel.id) {
+      // 改问资产专用端点（实测一直是全的，而且带 digest）
+      const repo = parseGitHubRepo(url);
+      if (repo) {
+        try {
+          const r2 = await fetchText(
+            `https://api.github.com/repos/${repo.owner}/${repo.repo}/releases/${rel.id}/assets?per_page=100`,
+            { headers: { ...headers, Accept: 'application/vnd.github+json' }, timeout },
+          );
+          if (r2.status >= 200 && r2.status < 300) {
+            const a = JSON.parse(r2.text);
+            if (Array.isArray(a)) assets = a;
+          }
+        } catch { /* 拿不到就按原样继续 */ }
+      }
+    }
     const asset =
       assets.find(a => /^app-.*\.tgz$/i.test(a.name)) ||
       assets.find(a => /\.tgz$/i.test(a.name)) ||
@@ -277,16 +513,17 @@ async function fetchManifest(url, headers = {}, timeout = 15000) {
       throw new Error('该 Release 没有可下载的更新包（请在 Release 里上传 app-<版本>.tgz 或 .fpk）');
     }
     return {
-      version: String(d.tag_name || '').replace(/^v/, ''),
-      notes: (d.body || '').slice(0, 3000),
+      version: String(rel.tag_name || '').replace(/^v/, ''),
+      notes: (rel.body || '').slice(0, 3000),
       url: asset.browser_download_url,
       assetName: asset.name,
       size: asset.size || 0,
-      // GitHub 现在会给资产算 sha256（形如 "sha256:abc..."），拿它做完整性校验，
+      // GitHub 会给资产算 sha256（形如 "sha256:abc..."），拿它做完整性校验，
       // 这样即使走第三方镜像下载也能保证内容没被篡改。
       sha256: String(asset.digest || '').replace(/^sha256:/i, ''),
-      publishedAt: d.published_at || '',
+      publishedAt: rel.published_at || '',
       source: 'github',
+      via: 'api',
     };
   }
 
@@ -299,7 +536,31 @@ async function fetchManifest(url, headers = {}, timeout = 15000) {
     sha256: d.sha256 || '',
     publishedAt: d.publishedAt || '',
     source: 'custom',
+    via: 'api',
   };
+}
+
+/**
+ * 拉取更新清单：先走 API（信息最全，带官方 sha256），
+ * 失败且是 GitHub 源时自动降级到免配额的公开页面通道。
+ */
+async function fetchManifest(url, headers = {}, timeout = 15000, src = null) {
+  const isGh = /api\.github\.com\/repos\/[^/]+\/[^/]+\/releases/.test(url);
+  let apiErr;
+  try {
+    return await withRetry(() => fetchManifestViaApi(url, headers, timeout), { attempts: 2 });
+  } catch (err) {
+    if (!isGh) throw err;
+    apiErr = err;
+  }
+  const repo = (src && src.repo) || parseGitHubRepo(url);
+  if (!repo) throw apiErr;
+  try {
+    return await withRetry(() => fetchManifestViaPages(repo, timeout), { attempts: 3 });
+  } catch (err2) {
+    // 两条通道都失败时，两条原因都报出来（方便用户判断是网络问题还是仓库问题）
+    throw new Error(`${apiErr.message}；已自动改用免配额通道重试，仍失败：${err2.message}`);
+  }
 }
 
 export async function checkUpdate({ force = false } = {}) {
@@ -316,7 +577,7 @@ export async function checkUpdate({ force = false } = {}) {
   const attempts = [];
   for (const src of sources) {
     try {
-      const latest = await fetchManifest(src.url, src.headers, src.timeout);
+      const latest = await fetchManifest(src.url, src.headers, src.timeout, src);
       const has = cmpVersion(latest.version, current) > 0;
       lastCheck = {
         at: Date.now(),
@@ -328,6 +589,9 @@ export async function checkUpdate({ force = false } = {}) {
         size: latest.size,
         publishedAt: latest.publishedAt,
         source: latest.source,
+        via: latest.via || 'api',
+        pageBase: latest.pageBase || '',        // 免配额通道实际用了哪个入口（直连 / 镜像名）
+        sha256Present: !!latest.sha256,   // 是否拿到官方 SHA256（决定下载后的校验强度）
         sourceLabel: src.label,
         fallback: attempts.length,
         attempts,
@@ -420,11 +684,16 @@ async function downloadOnce(url, headers, timeoutMs = DOWNLOAD_CANDIDATE_TIMEOUT
 }
 
 async function downloadFromSource(src) {
-  const man = await fetchManifest(src.url, src.headers, src.timeout);
+  const man = await fetchManifest(src.url, src.headers, src.timeout, src);
 
-  // 候选地址：先直连，再依次尝试公共镜像
-  const candidates = [{ label: '直连', url: man.url, auth: true }];
-  if (man.source === 'github' && GITHUB_ASSET_RE.test(man.url)) {
+  // 候选地址：先按清单给出的地址（可能是直连，也可能是免配额通道挑中的镜像），再依次试其它镜像。
+  // auth 只在「地址确实在 github.com 上」时才带 —— 否则会把 GitHub Token 泄露给第三方镜像。
+  const onGitHub = GITHUB_ASSET_RE.test(man.url);
+  const firstLabel = man.via === 'pages'
+    ? `免配额通道（${man.pageBase || '直连'}）`
+    : '直连';
+  const candidates = [{ label: firstLabel, url: man.url, auth: onGitHub }];
+  if (man.source === 'github' && onGitHub) {
     for (const m of GITHUB_MIRRORS) candidates.push({ label: `镜像 ${m.label}`, url: m.prefix + man.url, auth: false });
   }
 

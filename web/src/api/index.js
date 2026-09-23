@@ -1,4 +1,4 @@
-const VERSION = 'v1.0.7'
+const VERSION = 'v1.0.8'
 
 export async function api(path, options = {}) {
   const res = await fetch(path, {

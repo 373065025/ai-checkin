@@ -335,11 +335,20 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
         <span class="up-bar-txt">{{ upState.message }} · {{ upState.progress }}%</span>
       </div>
       <div v-else-if="upState.state === 'error'" class="up-bar-err">{{ upState.error || '更新失败' }}</div>
+      <!-- 检查失败也要说清楚原因（旧版只说「检查失败」，用户无从判断） -->
+      <div v-else-if="updateInfo?.error" class="up-bar-err">
+        {{ updateInfo.error }}
+        <template v-if="repoHref">
+          <br />可到 <a :href="repoHref + '/releases/latest'" target="_blank" rel="noreferrer">Release 页</a>
+          下载 .fpk 后，在「应用中心 → 手动安装」升级。
+        </template>
+      </div>
 
       <div class="update-foot">
         <span class="up-src-note">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
           更新源：<template v-if="repoHref"><a :href="repoHref" target="_blank" rel="noreferrer">{{ repoLabel }}</a></template><template v-else>{{ repoLabel }}</template>
+          <template v-if="updateInfo?.via === 'pages'"> · 免配额通道</template>
         </span>
         <div class="foot-actions" style="align-items:center;gap:14px">
           <label class="opt">
