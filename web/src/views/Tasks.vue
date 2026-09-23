@@ -11,16 +11,27 @@ const runningId = ref(null)
 const curlText = ref('')
 const showCurl = ref(false)
 
-// WorkBuddy 登录态（迁至任务内，每个任务单独配置）
+// WorkBuddy 登录态（每个任务独立配置 → 支持同一平台多账号）
 const wbRaw = ref('')
 const wbImporting = ref(false)
 const wbHasToken = ref(false)
 const wbMasked = ref('')
+const wbAccount = ref(null)     // 从 token 解析出的账号标识（昵称 + 打码手机号）
+const wbNote = ref('')          // 登录态文件里还提到其它账号时的提示
 const wbConfigured = computed(() => {
   const t = editing.value?.token
   if (t === '__CLEAR__') return false
   return !!t || wbHasToken.value
 })
+
+// 当前 WorkBuddy 任务数量：决定是否允许删除（至少保留一个内置任务）
+const wbCount = computed(() => (state.value?.providers || []).filter((p) => p.type === 'workbuddy').length)
+
+function accountText(p) {
+  const a = p.account
+  if (!a) return ''
+  return [a.nickname, a.phoneMasked].filter(Boolean).join(' · ')
+}
 
 function newHttp() {
   return {
@@ -29,6 +40,22 @@ function newHttp() {
     enabled: true,
     schedule: { times: ['09:00'] },
     http: { url: '', method: 'GET', headersText: '', body: '', successRule: { kind: 'status', expr: '200', value: '' } },
+  }
+}
+
+// 新增一个 WorkBuddy 账号（多账号：每个账号一个任务，各自独立的登录态与执行时间）
+function newWorkbuddy() {
+  const n = wbCount.value + 1
+  return {
+    type: 'workbuddy',
+    name: n > 1 ? `WorkBuddy 加油站 ${n}` : 'WorkBuddy 加油站',
+    enabled: true,
+    schedule: { times: ['09:00'] },
+    token: '',
+    domain: 'www.codebuddy.cn',
+    autoCheckin: true,
+    travelAuto: true,
+    locationId: 0,
   }
 }
 
@@ -43,11 +70,15 @@ function editProvider(p) {
   if (e.type === 'workbuddy') {
     wbHasToken.value = !!p.tokenPresent
     wbMasked.value = p.tokenMasked || ''
+    wbAccount.value = p.account || null
+    // 账号信息由后端从 token 解析，前端不回传，避免把旧值写回
     delete e.tokenMasked
     delete e.tokenPresent
+    delete e.account
   }
   editing.value = e
   wbRaw.value = ''
+  wbNote.value = ''
   curlText.value = ''
   showCurl.value = false
 }
@@ -65,13 +96,31 @@ async function doWbImport() {
   if (!wbRaw.value.trim()) { toast('请先粘贴登录态内容或 token', 'err'); return }
   wbImporting.value = true
   try {
-    const r = await importWb(wbRaw.value)
+    const r = await importWb(wbRaw.value, editing.value.id || '')
     editing.value.token = r.token
     editing.value.domain = r.domain || editing.value.domain
     wbHasToken.value = true
     wbMasked.value = r.masked
+    wbAccount.value = r.account || null
     wbRaw.value = ''
-    toast(`登录态已导入（${r.masked}），保存后生效`)
+
+    // 未命名的新任务：直接用账号昵称命名，多账号时一眼能分清
+    const nm = r.account?.nickname
+    if (nm && (!editing.value.id) && (!editing.value.name || /^WorkBuddy 加油站( \d+)?$/.test(editing.value.name))) {
+      editing.value.name = `WorkBuddy · ${nm}`
+    }
+
+    const who = r.account ? [r.account.nickname, r.account.phoneMasked].filter(Boolean).join(' · ') : r.masked
+    if (r.duplicateOf) {
+      wbNote.value = `该账号已存在于「${r.duplicateOf.name}」，同一账号添加两次会重复签到。`
+      toast(`已导入 ${who}，但这个账号已经添加过了`, 'err')
+    } else {
+      wbNote.value = r.otherAccounts?.length
+        ? `该登录态文件里还记录着 ${r.otherAccounts.map((a) => a.nickname || a.phoneMasked).join('、')} —— 但那几个账号没有 token。`
+          + `请在电脑端切换到对应账号，再各导出一次登录态文件，即可把多个账号都加进来。`
+        : ''
+      toast(`已导入 ${who}，保存后生效`)
+    }
   } catch (e) { toast(e.message, 'err') }
   wbImporting.value = false
 }
@@ -80,6 +129,8 @@ function clearWbToken() {
   editing.value.token = '__CLEAR__'
   wbHasToken.value = false
   wbMasked.value = ''
+  wbAccount.value = null
+  wbNote.value = ''
   toast('已标记清除，保存后生效')
 }
 
@@ -153,6 +204,7 @@ async function save() {
   const e = JSON.parse(JSON.stringify(editing.value))
   delete e.tokenMasked
   delete e.tokenPresent
+  delete e.account      // 账号标识由后端从 token 解析，前端不参与写入
   if (e.type === 'http') {
     const headers = {}
     for (const line of (e.http.headersText || '').split('\n')) {
@@ -209,7 +261,10 @@ const typeText = (t) => (t === 'workbuddy' ? 'WorkBuddy 加油站' : 'HTTP 签�
         <div class="page-title">签到任务</div>
         <div class="page-sub">每个签到任务独立配置执行时间与登录态，互不影响</div>
       </div>
-      <button class="btn primary" @click="editing = newHttp()">＋ 新增平台签到</button>
+      <div class="inline">
+        <button class="btn" @click="editing = newWorkbuddy()">＋ 添加 WorkBuddy 账号</button>
+        <button class="btn primary" @click="editing = newHttp()">＋ 新增平台签到</button>
+      </div>
     </div>
 
     <div v-for="p in state.providers" :key="p.id" class="task-item">
@@ -217,6 +272,7 @@ const typeText = (t) => (t === 'workbuddy' ? 'WorkBuddy 加油站' : 'HTTP 签�
         <div class="name">
           {{ p.name }}
           <span class="tag">{{ typeText(p.type) }}</span>
+          <span v-if="accountText(p)" class="tag">{{ accountText(p) }}</span>
           <span class="tag" :class="p.enabled ? 'ok' : ''">{{ p.enabled ? '已启用' : '已停用' }}</span>
           <span v-if="p.type === 'workbuddy' && !p.tokenPresent" class="tag err">未配置登录态</span>
         </div>
@@ -241,7 +297,7 @@ const typeText = (t) => (t === 'workbuddy' ? 'WorkBuddy 加油站' : 'HTTP 签�
         </button>
         <button class="btn small" @click="editProvider(p)">编辑</button>
         <button class="btn small" @click="toggle(p)">{{ p.enabled ? '停用' : '启用' }}</button>
-        <button v-if="p.type !== 'workbuddy'" class="btn small danger" @click="del(p)">删除</button>
+        <button v-if="p.type !== 'workbuddy' || wbCount > 1" class="btn small danger" @click="del(p)">删除</button>
       </div>
     </div>
 
@@ -285,6 +341,10 @@ const typeText = (t) => (t === 'workbuddy' ? 'WorkBuddy 加油站' : 'HTTP 签�
                 {{ wbConfigured ? (wbMasked || '已配置') : '未配置登录态' }}
               </span>
             </div>
+            <div v-if="wbAccount" class="account-row">
+              <span class="account-name">🐾 {{ wbAccount.nickname || '（昵称未知）' }}</span>
+              <span v-if="wbAccount.phoneMasked" class="account-phone">{{ wbAccount.phoneMasked }}</span>
+            </div>
             <div class="field">
               <label>粘贴登录态 JSON 或 token</label>
               <textarea v-model="wbRaw" placeholder='{"auth":{"accessToken":"eyJ...","domain":"www.codebuddy.cn"}}'></textarea>
@@ -299,8 +359,12 @@ const typeText = (t) => (t === 'workbuddy' ? 'WorkBuddy 加油站' : 'HTTP 签�
               </label>
               <button class="btn small danger" v-if="wbConfigured" @click="clearWbToken">清除登录态</button>
             </div>
+            <div v-if="wbNote" class="hint warn-hint">{{ wbNote }}</div>
           </div>
           <div class="hint" style="margin-bottom:18px">
+            一个账号一个任务：要给多个 WorkBuddy 账号签到，就在「签到任务」页多次点<b>＋ 添加 WorkBuddy 账号</b>，
+            每个任务各自导入对应的登录态、各自设置执行时间。导入后会自动识别账号昵称，方便区分。
+            <br />
             NAS 上没有 WorkBuddy 客户端，需从电脑端导入一次登录态：电脑端登录 WorkBuddy 后打开
             <code>%LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info</code>，
             把整个文件内容粘贴到上面（或直接选择该文件），系统自动提取 <code>accessToken</code> 与 <code>domain</code>；

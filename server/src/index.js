@@ -9,7 +9,7 @@ import { agreementPayload, AGREEMENT_REVISION } from './lib/agreement.js';
 import { runProvider, liveSnapshot, readLive, slimLive } from './lib/providers.js';
 import { startScheduler } from './lib/scheduler.js';
 import { sendNotify } from './lib/notify.js';
-import { maskToken, uid, tryJson, parseCurl, nowText } from './lib/util.js';
+import { maskToken, accountOfToken, maskPhone, uid, tryJson, parseCurl, nowText } from './lib/util.js';
 import { fetchStatus, fetchGrowth, fetchTravel, TRAVEL_DOMAIN } from './lib/wb.js';
 import {
   APP_ROOT, getCurrentVersion, checkUpdate, performUpdate, getUpdateStatus,
@@ -78,6 +78,11 @@ function maskProvider(p) {
     out.tokenMasked = maskToken(p.token);
     out.tokenPresent = !!p.token;
     delete out.token;
+    // 账号标识（昵称 + 打码手机号）用于多账号区分；查询类接口不返回账号信息，
+    // 所以只在导入/保存时从 JWT 解析一次并落盘，界面只读展示
+    out.account = p.account
+      ? { uid: p.account.uid || '', nickname: p.account.nickname || '', phoneMasked: p.account.phoneMasked || '' }
+      : (p.token ? accountOfToken(p.token) || null : null);
   }
   // 带上「上次已知的实时快照」：签到中心首屏即可渲染状态，不必先等远端
   // 内存缓存优先（最新），其次用上次持久化的精简值（重启后依然秒开）
@@ -99,7 +104,11 @@ function buildBackup(secrets) {
     const c = { ...p };
     delete c.lastRun;   // 运行期状态不进备份
     delete c.lastLive;
-    if (!secrets && c.token) c.token = '';
+    if (!secrets) {
+      // 不带凭据的备份常常被拿去发给别人排查 → 连账号昵称/手机号也一并去掉
+      if (c.token) c.token = '';
+      delete c.account;
+    }
     return c;
   });
   return {
@@ -129,18 +138,21 @@ function sanitizeProviders(list, existing) {
   const usedIds = new Set();
   for (const raw of list) {
     if (!raw || typeof raw !== 'object') continue;
-    const type = raw.type === 'workbuddy' ? 'workbuddy' : 'http';
     let id = str(raw.id, 40);
     if (!id || usedIds.has(id)) id = uid();
     usedIds.add(id);
 
+    const rawType = raw.type === 'workbuddy' ? 'workbuddy' : 'http';
+    const rawAccount = rawType === 'workbuddy' && raw.account && typeof raw.account === 'object' ? raw.account : null;
+    const rawAccountUid = str(rawAccount?.uid, 64);
+    // 多账号时的匹配次序：任务 id → 账号 uid（同一账号换个任务 id 也能续上登录态）→ 无
     const prev = existing.find((x) => x.id === id)
-      || (type === 'workbuddy' ? existing.find((x) => x.type === 'workbuddy') : null);
+      || (rawAccountUid ? existing.find((x) => x.type === 'workbuddy' && x.account?.uid === rawAccountUid) : null);
 
     const base = {
       id,
-      type,
-      name: str(raw.name, 60) || (type === 'workbuddy' ? 'WorkBuddy 加油站' : '未命名任务'),
+      type: rawType,
+      name: str(raw.name, 60) || (rawType === 'workbuddy' ? 'WorkBuddy 加油站' : '未命名任务'),
       enabled: bool(raw.enabled, true),
       schedule: {
         times: Array.isArray(raw.schedule?.times)
@@ -152,12 +164,16 @@ function sanitizeProviders(list, existing) {
     };
     if (!base.schedule.times.length) base.schedule.times = ['09:00'];
 
-    if (type === 'workbuddy') {
+    if (rawType === 'workbuddy') {
       const token = str(raw.token, 8192);
+      const account = token
+        ? accountOfToken(token)
+        : (prev?.account ? { ...prev.account } : (rawAccountUid ? { uid: rawAccountUid, nickname: str(rawAccount?.nickname, 60), phoneMasked: str(rawAccount?.phoneMasked, 30) } : null));
       out.push({
         ...base,
         // 空 token → 保留本机现有登录态（导入「不含凭据」的备份时不会把凭据清掉）
         token: token || prev?.token || '',
+        account: (token || prev?.token) ? account : null,
         domain: str(raw.domain, 120) || prev?.domain || 'www.codebuddy.cn',
         autoCheckin: bool(raw.autoCheckin, true),
         travelAuto: bool(raw.travelAuto, true),
@@ -287,15 +303,25 @@ async function handleApi(req, res, url) {
   if (req.method === 'POST' && p === '/api/wb/import') {
     const body = await readJson(req);
     const raw = String(body.raw || '').trim();
+    const selfId = str(body.id, 40);
     if (!raw) return json(res, 400, { ok: false, message: '内容为空' });
     let token = '';
     let domain = '';
+    let fileAccounts = [];
     const j = tryJson(raw);
     if (j) {
       const auth = j.auth || j.data?.auth || j;
       token = auth.accessToken || auth.access_token || '';
       domain = auth.domain || '';
       if (!token) token = j.accessToken || '';
+      // 桌面端登录态文件里会列出该机器上登录过的所有账号（只有当前账号带 token），
+      // 用来提示用户「还差哪几个账号要单独导出」
+      const arr = j.allAccounts || j.accounts;
+      if (Array.isArray(arr)) {
+        fileAccounts = arr
+          .map((a) => ({ nickname: str(a?.nickname, 60), phoneMasked: maskPhone(a?.phoneNumber || a?.phone || '') }))
+          .filter((a) => a.nickname || a.phoneMasked);
+      }
     }
     if (!token && /^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(raw)) token = raw;
     if (!token) {
@@ -304,12 +330,32 @@ async function handleApi(req, res, url) {
     }
     if (!token) return json(res, 400, { ok: false, message: '未找到 accessToken，请确认粘贴的是完整登录态 JSON 或 token 本体' });
     if (!domain) domain = 'www.codebuddy.cn';
-    return json(res, 200, { ok: true, token, domain, masked: maskToken(token) });
+
+    const account = accountOfToken(token);
+    // 同一个账号被重复添加是常见误操作 → 提前告诉用户它已经存在
+    const dup = account?.uid
+      ? s.providers.find((x) => x.type === 'workbuddy' && x.id !== selfId && x.account?.uid === account.uid)
+      : null;
+    // 文件里有、但当前登录态没带 token 的其它账号（需要用户切换账号后再各导出一次）
+    const selfLabel = account?.phoneMasked || '';
+    const otherAccounts = fileAccounts.filter((a) => !selfLabel || a.phoneMasked !== selfLabel);
+
+    return json(res, 200, {
+      ok: true,
+      token,
+      domain,
+      masked: maskToken(token),
+      account,
+      duplicateOf: dup ? { id: dup.id, name: dup.name } : null,
+      otherAccounts,
+    });
   }
 
-  // 新增 / 更新任务
+  // 新增 / 更新任务（WorkBuddy 支持多账号：每个账号一个任务，各自独立的登录态与执行时间）
   if (req.method === 'POST' && p === '/api/providers') {
     const body = await readJson(req);
+    delete body.tokenMasked;
+    delete body.tokenPresent;
     const idx = body.id ? s.providers.findIndex((x) => x.id === body.id) : -1;
     if (idx >= 0) {
       const old = s.providers[idx];
@@ -318,19 +364,30 @@ async function handleApi(req, res, url) {
       if (old.type === 'workbuddy') {
         if (next.token === '__CLEAR__') next.token = '';
         else if (!next.token || next.token === '__KEEP__') next.token = old.token;
+        // 账号标识只从「这次真正传来的明文 token」重算，避免前端把旧值写回
+        if (body.token && body.token !== '__KEEP__' && body.token !== '__CLEAR__') {
+          const acc = accountOfToken(body.token);
+          if (acc) next.account = acc;
+        }
+        if (!next.token) next.account = null;
       }
       s.providers[idx] = next;
     } else {
+      const isWb = body.type === 'workbuddy';
+      const token = isWb ? str(body.token, 8192) : '';
+      const account = isWb ? accountOfToken(token) : null;
       const np = {
         id: uid(),
-        type: body.type || 'http',
-        name: body.name || '未命名任务',
+        type: isWb ? 'workbuddy' : 'http',
+        // 没填名字时用账号昵称兜底，多账号才不会都叫「WorkBuddy 加油站」
+        name: str(body.name, 60) || account?.nickname || (isWb ? 'WorkBuddy 加油站' : '未命名任务'),
         enabled: body.enabled !== false,
         schedule: body.schedule || { times: ['09:00'] },
-        ...(body.type === 'workbuddy'
+        ...(isWb
           ? {
-              token: body.token || '',
-              domain: body.domain || 'www.codebuddy.cn',
+              token,
+              account,
+              domain: str(body.domain, 120) || 'www.codebuddy.cn',
               autoCheckin: body.autoCheckin !== false,
               travelAuto: body.travelAuto !== false,
               locationId: Number(body.locationId) || 0,
@@ -350,7 +407,11 @@ async function handleApi(req, res, url) {
     const body = await readJson(req);
     const idx = s.providers.findIndex((x) => x.id === body.id);
     if (idx < 0) return json(res, 404, { ok: false, message: '任务不存在' });
-    if (s.providers[idx].type === 'workbuddy') return json(res, 400, { ok: false, message: '内置 WorkBuddy 任务不可删除（可停用）' });
+    // WorkBuddy 允许删除（多账号时），但必须保留至少一个内置任务
+    if (s.providers[idx].type === 'workbuddy'
+      && s.providers.filter((x) => x.type === 'workbuddy').length <= 1) {
+      return json(res, 400, { ok: false, message: '至少要保留一个 WorkBuddy 任务（可停用）' });
+    }
     s.providers.splice(idx, 1);
     save();
     return json(res, 200, { ok: true, providers: s.providers.map(maskProvider) });
@@ -381,15 +442,22 @@ async function handleApi(req, res, url) {
     return json(res, 200, { ok: allOk, results });
   }
 
-  // 总览实时数据（只读）
+  // 总览实时数据（只读）。多账号：用 ?id=<任务id> 指定；不传则取第一个 WorkBuddy 任务
   if (req.method === 'GET' && p === '/api/wb/live') {
-    const prov = s.providers.find((x) => x.type === 'workbuddy');
-    if (!prov?.token) return json(res, 200, { ok: false, message: '未配置 token' });
+    const id = url.searchParams.get('id');
+    const prov = id
+      ? s.providers.find((x) => x.id === id && x.type === 'workbuddy')
+      : s.providers.find((x) => x.type === 'workbuddy');
+    if (!prov) return json(res, 404, { ok: false, message: 'WorkBuddy 任务不存在' });
+    if (!prov.token) return json(res, 200, { ok: false, message: '未配置 token' });
+    const domain = prov.domain || 'www.codebuddy.cn';
     try {
-      const status = await fetchStatus(prov.domain || 'www.codebuddy.cn', prov.token);
-      const growth = await fetchGrowth(prov.domain || 'www.codebuddy.cn', prov.token);
-      const travel = await fetchTravel(prov.token);
-      return json(res, 200, { ok: true, status, growth, travel });
+      const [status, growth, travel] = await Promise.all([
+        fetchStatus(domain, prov.token),
+        fetchGrowth(domain, prov.token),
+        fetchTravel(prov.token),
+      ]);
+      return json(res, 200, { ok: true, account: maskProvider(prov).account, status, growth, travel });
     } catch (e) {
       return json(res, 200, { ok: false, message: e.message });
     }

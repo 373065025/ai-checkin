@@ -1,4 +1,4 @@
-const VERSION = 'v1.0.6'
+const VERSION = 'v1.0.7'
 
 export async function api(path, options = {}) {
   const res = await fetch(path, {
@@ -12,7 +12,8 @@ export async function api(path, options = {}) {
 
 export const getState = () => api('/api/state')
 export const saveSettings = (body) => api('/api/settings', { method: 'POST', body: JSON.stringify(body) })
-export const importWb = (raw) => api('/api/wb/import', { method: 'POST', body: JSON.stringify({ raw }) })
+// id = 当前正在编辑的任务 id（用于识别「这个账号是不是已经加过了」）
+export const importWb = (raw, id = '') => api('/api/wb/import', { method: 'POST', body: JSON.stringify({ raw, id }) })
 export const saveProvider = (p) => api('/api/providers', { method: 'POST', body: JSON.stringify(p) })
 export const deleteProvider = (id) => api('/api/providers/delete', { method: 'POST', body: JSON.stringify({ id }) })
 export const toggleProvider = (id) => api('/api/providers/toggle', { method: 'POST', body: JSON.stringify({ id }) })

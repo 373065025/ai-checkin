@@ -26,6 +26,45 @@ export const maskToken = (t) => {
   return `${t.slice(0, 10)}...${t.slice(-6)}（已保存，长度${t.length}）`;
 };
 
+/** 手机号打码：17725142573 → 177****2573 */
+export const maskPhone = (p) => {
+  const s = String(p || '').replace(/\D/g, '');
+  if (s.length < 7) return s ? '****' : '';
+  return `${s.slice(0, 3)}****${s.slice(-4)}`;
+};
+
+/**
+ * 解析 JWT 的 payload 段（不校验签名，仅用于「认出这是哪个账号」）。
+ * WorkBuddy 的 accessToken 是 JWT，payload 里带 nickname / preferred_username / sub，
+ * 而查询类接口不返回任何账号信息，所以只能从这里拿标识。
+ * 解析失败一律返回 null，绝不抛错。
+ */
+export function decodeJwtPayload(token) {
+  if (!token || typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  try {
+    const json = Buffer.from(parts[1].replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8');
+    const p = JSON.parse(json);
+    return p && typeof p === 'object' ? p : null;
+  } catch { return null; }
+}
+
+/**
+ * 从 token 推断账号标识（用于多账号区分）。
+ * @returns {{uid:string, nickname:string, phoneMasked:string, email:string}|null}
+ */
+export function accountOfToken(token) {
+  const p = decodeJwtPayload(token);
+  if (!p) return null;
+  const uid = String(p.sub || p.uid || p.oneid_union_id || '').slice(0, 64);
+  const nickname = String(p.nickname || p.name || p.preferred_username || '').slice(0, 60);
+  const phoneMasked = maskPhone(p.phone_number || p.preferred_username || '');
+  const email = String(p.email || '').slice(0, 120);
+  if (!uid && !nickname && !phoneMasked) return null;
+  return { uid, nickname, phoneMasked, email };
+}
+
 // 带重试的 fetch：网络错误 / 5xx / 空响应 重试
 export async function fetchRetry(url, options = {}, { retries = 2, timeoutMs = 15000 } = {}) {
   let lastErr = null;

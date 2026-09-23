@@ -17,6 +17,12 @@ const today = todayStr()
 const enabledProviders = computed(() => state.value?.providers?.filter((p) => p.enabled) || [])
 const totalEnabled = computed(() => enabledProviders.value.length)
 
+// 一个 WorkBuddy 登录态都没配时才提示（多账号下只要有一个配好就不该打扰）
+const wbMissing = computed(() => {
+  const wbs = (state.value?.providers || []).filter((p) => p.type === 'workbuddy')
+  return wbs.length > 0 && !wbs.some((p) => p.tokenPresent)
+})
+
 const signedTodayCount = computed(() => {
   return enabledProviders.value.filter((p) => isSignedToday(p)).length
 })
@@ -26,7 +32,7 @@ const syncing = computed(() => enabledProviders.value.some((p) => liveOf(p)?.ref
 
 function platformMeta(p) {
   if (p.type === 'workbuddy') {
-    return { icon: '🐾', color: '#30d158', alias: 'WorkBuddy' }
+    return { icon: '🐾', color: '#30d158', alias: p.account?.nickname || 'WorkBuddy' }
   }
   const n = p.name.toLowerCase()
   if (n.includes('千帆') || n.includes('百度')) return { icon: '🌊', color: '#0a84ff', alias: '百度千帆' }
@@ -35,6 +41,12 @@ function platformMeta(p) {
   if (n.includes('wps')) return { icon: '📄', color: '#ff453a', alias: 'WPS' }
   if (n.includes('link')) return { icon: '🔗', color: '#64d2ff', alias: 'Link AI' }
   return { icon: '⚙️', color: '#8e8e93', alias: '自定义' }
+}
+
+// 多账号时用来区分「这张卡是哪个 WorkBuddy 账号」
+function accountText(p) {
+  if (p.type !== 'workbuddy' || !p.account) return ''
+  return [p.account.nickname, p.account.phoneMasked].filter(Boolean).join(' · ')
 }
 
 function liveOf(p) {
@@ -226,7 +238,10 @@ function goTasks() { router.push('/tasks') }
         :style="{ '--brand': platformMeta(p).color }">
         <div class="card-head">
           <div class="brand-icon">{{ platformMeta(p).icon }}</div>
-          <div class="card-title">{{ p.name }}</div>
+          <div class="card-title">
+            {{ p.name }}
+            <small v-if="accountText(p)" class="sub">{{ accountText(p) }}</small>
+          </div>
           <div class="status-dot" :class="cardStatus(p).dot"></div>
           <span class="tag" :class="cardStatus(p).cls">{{ cardStatus(p).text }}</span>
         </div>
@@ -247,11 +262,13 @@ function goTasks() { router.push('/tasks') }
     </div>
 
     <!-- 未配置 WorkBuddy 提示 -->
-    <div class="panel" style="margin-top:18px" v-if="!state.providers.find((p)=>p.type==='workbuddy')?.tokenPresent">
+    <div class="panel" style="margin-top:18px" v-if="wbMissing">
       <h3>WorkBuddy 尚未配置登录态</h3>
       <div class="hint" style="margin-bottom:12px">
         到「签到任务」页点开 WorkBuddy 任务的<b>编辑</b>，在<b>登录态</b>里粘贴一次即可（每个任务独立配置）。NAS 上没有 WorkBuddy
         客户端，需要把电脑端 <code>workbuddy-desktop.info</code> 的文件内容复制过来。
+        <br />
+        有多个 WorkBuddy 账号？在「签到任务」页点<b>＋ 添加 WorkBuddy 账号</b>可以加任意多个，每个账号各自导入登录态、各自设置执行时间。
       </div>
       <button class="btn primary" @click="goTasks">去配置</button>
     </div>
