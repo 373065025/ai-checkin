@@ -56,6 +56,10 @@ export async function runHttpProvider(opts) {
     const actual = j == null ? undefined : pickPath(j, rule.expr || '');
     ok = String(actual) === String(rule.value ?? '');
     detail = `HTTP ${status}，${rule.expr} = ${actual === undefined ? '(不存在)' : JSON.stringify(actual)}`;
+  } else if (rule.kind === 'always') {
+    // 「总是判定成功」：只看请求有没有发出去，不看响应内容
+    ok = true;
+    detail = `HTTP ${status}（始终判定成功）`;
   } else {
     ok = status >= 200 && status < 400;
     detail = `HTTP ${status}`;
@@ -106,7 +110,9 @@ export async function runProvider(provider, settings, trigger = 'manual') {
     const merged = {
       ...prev,
       ok: true,
-      status: { ...(prev.status || {}), ...result.statusData },
+      // wb.js 现在回传完整的上游 status（含 checkin_dates 全量数组），
+      // 这里先归一化出「本月打卡天数」再合并，界面才拿得到最新值
+      status: { ...(prev.status || {}), ...normalizeStatus(result.statusData) },
       fetchedAt: Date.now(),
     };
     if (!merged.travel) merged.travel = prev.travel || null;
@@ -167,7 +173,7 @@ function normalizeStatus(st) {
 /** 精简快照：只留界面用得上的字段，与完整快照保持同样的取值路径 */
 export function slimLive(snap, ts = Date.now()) {
   if (!snap || !snap.ok) return { ok: false, message: snap?.message || '', ts };
-  const st = snap.status || {};
+  const st = normalizeStatus(snap.status || {});
   return {
     ok: true,
     ts,
@@ -193,6 +199,12 @@ export function readLive(id) {
   if (!c) return null;
   const age = Date.now() - c.at;
   return { ...c.data, at: c.at, age, fresh: age < LIVE_TTL_MS, cached: true };
+}
+
+/** 任务被删掉后清掉它的快照，避免缓存无意义地增长 */
+export function dropLive(id) {
+  liveCache.delete(id);
+  liveInflight.delete(id);
 }
 
 /** 真正打远端（三路并行） */
@@ -225,10 +237,18 @@ export function refreshLive(provider) {
   const task = (async () => {
     try {
       const data = await fetchLiveSnapshot(provider);
-      liveCache.set(id, { at: Date.now(), data });
-      // 持久化精简版：重启后首屏立刻可用（不含 growth 明细，避免撑大 settings.json）
-      provider.lastLive = slimLive(data, Date.now());
-      save();
+      const prev = liveCache.get(id);
+      if (data.ok || !prev?.data?.ok) {
+        liveCache.set(id, { at: Date.now(), data });
+        // 持久化精简版：重启后首屏立刻可用（不含 growth 明细，避免撑大 settings.json）
+        provider.lastLive = slimLive(data, Date.now());
+        save();
+      } else {
+        // 这次回源失败了（token 临时失效 / 网络抖动），但手上有上次成功的快照：
+        // 保留旧值，只把 TTL 往后推 —— 界面继续显示「今日已签到」，
+        // 不会因为一次抖动就把首屏打回「未签到」，90 秒后再悄悄重试
+        liveCache.set(id, { at: Date.now(), data: { ...prev.data, stale: true, lastError: data.message || '' } });
+      }
       return liveCache.get(id);
     } finally {
       liveInflight.delete(id);

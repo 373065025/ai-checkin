@@ -6,10 +6,11 @@ import { fileURLToPath } from 'node:url';
 
 import { VERSION, load, get, save, saveNow, addLog, getLogs, clearLogs, configDir, isAgreementAccepted, getAgreementState, acceptAgreement, revokeAgreement } from './lib/store.js';
 import { agreementPayload, AGREEMENT_REVISION } from './lib/agreement.js';
-import { runProvider, liveSnapshot, readLive, slimLive } from './lib/providers.js';
+import { runProvider, liveSnapshot, readLive, slimLive, dropLive } from './lib/providers.js';
 import { startScheduler } from './lib/scheduler.js';
 import { sendNotify } from './lib/notify.js';
-import { maskToken, accountOfToken, maskPhone, uid, tryJson, parseCurl, nowText } from './lib/util.js';
+import { authState, login, logout, setPassword, isAuthorized, isEnabled as adminEnabled, clientIp } from './lib/auth.js';
+import { maskToken, accountOfToken, maskPhone, uid, tryJson, parseCurl, nowText, mapLimit } from './lib/util.js';
 import { fetchStatus, fetchGrowth, fetchTravel, TRAVEL_DOMAIN } from './lib/wb.js';
 import {
   APP_ROOT, getCurrentVersion, checkUpdate, performUpdate, getUpdateStatus,
@@ -104,6 +105,7 @@ function buildBackup(secrets) {
     const c = { ...p };
     delete c.lastRun;   // 运行期状态不进备份
     delete c.lastLive;
+    delete c.lastTrigger;
     if (!secrets) {
       // 不带凭据的备份常常被拿去发给别人排查 → 连账号昵称/手机号也一并去掉
       if (c.token) c.token = '';
@@ -125,7 +127,7 @@ function buildBackup(secrets) {
     },
     // 明确写出「恢复时不会覆盖什么」，避免用户以为换机后连同意状态也一起带过去
     restoreScope: '恢复时会应用：任务（含登录态）、通知配置、定时策略、自动检查更新开关；'
-      + '协议同意状态与版本更新源保持本机设置不变。',
+      + '协议同意状态、管理员密码与版本更新源保持本机设置不变。',
   };
 }
 
@@ -161,6 +163,9 @@ function sanitizeProviders(list, existing) {
       },
       lastRun: prev?.lastRun || null,
       lastLive: prev?.lastLive || null,
+      // 「今天这个时间点已经跑过了」的标记不进备份文件，但恢复时从本机同 id 任务继承，
+      // 否则恢复到同一台机器会让当天的时间点再触发一次
+      lastTrigger: prev?.lastTrigger || null,
     };
     if (!base.schedule.times.length) base.schedule.times = ['09:00'];
 
@@ -254,6 +259,59 @@ async function handleApi(req, res, url) {
     return json(res, 200, { ok: true, version: VERSION, time: nowText() });
   }
 
+  // ===== 管理员密码（可选，默认关闭） =====
+  // 没设密码 → 行为与旧版一致，全部放行；设了密码 → 除登录相关接口外都要有效 session。
+  // 定时调度与自动更新是进程内部调用，不走 HTTP，不受密码影响。
+  const PUBLIC_API = ['/api/health', '/api/auth/status', '/api/auth/login'];
+  if (!PUBLIC_API.includes(p) && !isAuthorized(req)) {
+    return json(res, 401, { ok: false, needAuth: true, message: '请先登录管理员密码' });
+  }
+
+  if (req.method === 'GET' && p === '/api/auth/status') {
+    return json(res, 200, authState(req));
+  }
+
+  if (req.method === 'POST' && p === '/api/auth/login') {
+    const body = await readJson(req);
+    const r = login(req, String(body.password || ''));
+    if (!r.ok) {
+      if (r.locked) {
+        addLog({
+          providerName: '系统', trigger: 'manual', ok: false, durationMs: 0,
+          message: `管理员密码连续错误已达上限，来源 ${clientIp(req)} 已锁定 1 小时`,
+        });
+      }
+      return json(res, r.locked ? 429 : 401, {
+        ok: false,
+        needAuth: true,
+        locked: !!r.locked,
+        lockSeconds: r.lockSeconds || 0,
+        remaining: r.remaining || 0,
+        message: r.locked
+          ? `错误次数过多，已锁定 ${Math.ceil((r.lockSeconds || 0) / 60)} 分钟`
+          : `密码错误，还可尝试 ${r.remaining} 次`,
+      });
+    }
+    addLog({ providerName: '系统', trigger: 'manual', ok: true, durationMs: 0, message: `管理员登录成功（来源 ${clientIp(req)}）` });
+    return json(res, 200, r);
+  }
+
+  if (req.method === 'POST' && p === '/api/auth/logout') {
+    return json(res, 200, logout(req));
+  }
+
+  // 设置 / 修改 / 关闭密码：newPassword 为空 = 关闭（需验证旧密码）
+  if (req.method === 'POST' && p === '/api/auth/password') {
+    const body = await readJson(req);
+    const np = String(body.newPassword || '');
+    const r = setPassword(String(body.oldPassword || ''), np);
+    if (!r.ok) return json(res, 400, r);
+    addLog({ providerName: '系统', trigger: 'manual', ok: true, durationMs: 0, message: r.message });
+    // 刚设完密码就给自己发一个 session，免得保存后立刻被踢出去重新登录
+    const l = np ? login(req, np) : { token: '' };
+    return json(res, 200, { ...r, token: l.token || '' });
+  }
+
   // 「同意才能使用」：未同意用户协议前，后端拒绝一切实际执行动作（不只是前端遮挡）
   const AGREEMENT_GUARDED = ['/api/providers/run', '/api/run-all', '/api/notify/test', '/api/backup/restore'];
   if (req.method === 'POST' && AGREEMENT_GUARDED.includes(p) && !isAgreementAccepted()) {
@@ -274,6 +332,7 @@ async function handleApi(req, res, url) {
       scheduler: s.scheduler,
       agreementAccepted: isAgreementAccepted(),
       agreement: getAgreementState(),
+      adminEnabled: adminEnabled(),
       logs: getLogs(300),
     });
   }
@@ -311,7 +370,18 @@ async function handleApi(req, res, url) {
     const j = tryJson(raw);
     if (j) {
       const auth = j.auth || j.data?.auth || j;
-      token = auth.accessToken || auth.access_token || '';
+      const rawToken = auth.accessToken ?? auth.access_token ?? j.accessToken ?? '';
+      // 新版桌面端（实测）把 accessToken 加密成了 { $wbEncrypted, envelope } 对象，
+      // 本地拿不到明文 JWT —— 必须明确报错，否则会被当作导入成功但实际存了空登录态
+      if (rawToken && typeof rawToken === 'object') {
+        return json(res, 422, {
+          ok: false,
+          encryptedToken: true,
+          message: '检测到新版 WorkBuddy 桌面端的加密登录态（accessToken 已加密存储），无法直接导入。'
+            + '请粘贴从网络请求里复制的 accessToken 明文（以 eyJ 开头的三段式 JWT），或使用仍以明文保存登录态的桌面端版本导出。',
+        });
+      }
+      token = typeof rawToken === 'string' ? rawToken : '';
       domain = auth.domain || '';
       if (!token) token = j.accessToken || '';
       // 桌面端登录态文件里会列出该机器上登录过的所有账号（只有当前账号带 token），
@@ -413,6 +483,7 @@ async function handleApi(req, res, url) {
       return json(res, 400, { ok: false, message: '至少要保留一个 WorkBuddy 任务（可停用）' });
     }
     s.providers.splice(idx, 1);
+    dropLive(body.id); // 顺手清掉它的实时快照缓存
     save();
     return json(res, 200, { ok: true, providers: s.providers.map(maskProvider) });
   }
@@ -432,11 +503,11 @@ async function handleApi(req, res, url) {
       ? s.providers.filter((x) => x.enabled)
       : s.providers.filter((x) => x.id === body.id);
     if (!targets.length) return json(res, 404, { ok: false, message: '没有可执行的任务' });
-    const results = [];
-    for (const prov of targets) {
-      const r = await runProvider(prov, s, 'manual');
-      results.push({ id: prov.id, name: prov.name, ...r });
-    }
+    // 多账号时串行执行要几十秒（每个任务要好几个远端请求）→ 并发跑，但限制并发数
+    // 免得一次打爆上游；结果顺序仍与任务列表一致
+    const results = await mapLimit(targets, 4, async (prov) => ({
+      id: prov.id, name: prov.name, ...(await runProvider(prov, s, 'manual')),
+    }));
     save();
     const allOk = results.every((r) => r.ok);
     return json(res, 200, { ok: allOk, results });

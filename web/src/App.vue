@@ -1,7 +1,7 @@
 <script setup>
-import { ref, computed, onMounted, provide } from 'vue'
+import { ref, computed, onMounted, onUnmounted, provide } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
-import { VERSION, getState, getUpdateInfo, getAgreement, acceptAgreement } from './api/index.js'
+import { VERSION, getState, getUpdateInfo, getAgreement, acceptAgreement, authStatus, authLogin, setAdminToken, onUnauthorized } from './api/index.js'
 import AgreementContent from './components/AgreementContent.vue'
 
 const router = useRouter()
@@ -9,6 +9,57 @@ const route = useRoute()
 const state = ref(null)
 const toastMsg = ref(null)
 const hasUpdate = ref(false)
+
+// ===== 管理员密码登录 =====
+// 后端开启了管理员密码（设置页可配）时，未登录会先弹出这里；没设密码则永远不会出现
+const auth = ref(null)          // /api/auth/status 的结果
+const loginPwd = ref('')
+const loginBusy = ref(false)
+const loginErr = ref('')
+const lockLeft = ref(0)
+let lockTimer = null
+
+const needLogin = computed(() => !!auth.value?.enabled && !auth.value?.authed)
+
+function startLockCountdown(sec) {
+  lockLeft.value = sec
+  clearInterval(lockTimer)
+  if (sec <= 0) return
+  lockTimer = setInterval(() => {
+    lockLeft.value -= 1
+    if (lockLeft.value <= 0) {
+      clearInterval(lockTimer)
+      loadAuth().catch(() => {})
+    }
+  }, 1000)
+}
+
+async function loadAuth() {
+  try {
+    auth.value = await authStatus()
+    if (auth.value.locked) startLockCountdown(auth.value.lockSeconds)
+  } catch { /* 拿不到就不拦 */ }
+}
+
+async function doLogin() {
+  if (lockLeft.value > 0) return
+  loginBusy.value = true
+  loginErr.value = ''
+  try {
+    const r = await authLogin(loginPwd.value)
+    if (r.token) setAdminToken(r.token)
+    loginPwd.value = ''
+    loginErr.value = ''
+    await loadAuth()
+    await refresh()
+    showToast('已登录')
+  } catch (e) {
+    loginErr.value = e.message
+    try { await loadAuth() } catch {}
+    if (lockLeft.value > 0) loginErr.value = `错误次数过多，已锁定 ${Math.ceil(lockLeft.value / 60)} 分钟`
+  }
+  loginBusy.value = false
+}
 
 // ===== 用户协议与免责声明 =====
 const agreement = ref(null)      // 条款内容
@@ -71,10 +122,21 @@ async function checkNavUpdate() {
 }
 
 onMounted(async () => {
+  // 401 只负责拉起登录界面；错误文案留给「真的输错了」那次响应，避免一进页面就见红字
+  onUnauthorized((info) => {
+    if (info?.locked) {
+      loginErr.value = info.message || ''
+      startLockCountdown(info.lockSeconds || 0)
+    }
+    loadAuth().catch(() => {})
+  })
   await loadAgreement()
-  await refresh()
+  await loadAuth()
+  if (!needLogin.value) await refresh()
   checkNavUpdate()
 })
+
+onUnmounted(() => clearInterval(lockTimer))
 </script>
 
 <template>
@@ -123,6 +185,42 @@ onMounted(async () => {
         <div class="consent-actions">
           <button class="btn primary" @click="declined = false">返回重新阅读</button>
         </div>
+      </footer>
+    </div>
+  </div>
+
+  <!-- 开启了管理员密码且未登录：全屏登录（协议页之后、进入应用之前） -->
+  <div v-else-if="needLogin" class="consent">
+    <div class="consent-panel decline">
+      <header class="consent-head">
+        <h2>管理员验证</h2>
+        <p class="consent-sub">本应用已开启管理员密码保护</p>
+      </header>
+      <div class="consent-body" style="display:flex;flex-direction:column;justify-content:center">
+        <div class="field" style="max-width:340px;margin:0 auto;width:100%">
+          <input
+            v-model="loginPwd"
+            type="password"
+            placeholder="管理员密码"
+            :disabled="lockLeft > 0 || loginBusy"
+            @keyup.enter="doLogin"
+          />
+        </div>
+        <p v-if="loginErr" class="hint" style="color:#ff453a;text-align:center;margin:12px 0 0">{{ loginErr }}</p>
+        <p v-if="lockLeft > 0" class="hint" style="text-align:center;margin:12px 0 0">
+          已锁定，剩余 {{ Math.floor(lockLeft / 60) }} 分 {{ lockLeft % 60 }} 秒
+        </p>
+      </div>
+      <footer class="consent-foot">
+        <div class="consent-actions">
+          <button class="btn primary" :disabled="!loginPwd || loginBusy || lockLeft > 0" @click="doLogin">
+            {{ loginBusy ? '验证中…' : '进入' }}
+          </button>
+        </div>
+        <p class="hint" style="margin:10px 0 0;text-align:center">
+          连续输错 10 次将锁定来源 IP 一小时。忘记密码：编辑配置目录下 settings.json，
+          删除其中的 <code>admin</code> 字段后重启应用即可重置。
+        </p>
       </footer>
     </div>
   </div>

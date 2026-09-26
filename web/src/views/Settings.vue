@@ -1,6 +1,6 @@
 <script setup>
 import { ref, inject, computed, onMounted, onUnmounted } from 'vue'
-import { saveSettings, testNotify, getSystemInfo, getUpdateInfo, checkUpdate, getUpdateStatus, getUpdateBackups, applyUpdate, rollbackUpdate, saveUpdateConfig, fmtTime, backupExportUrl, previewRestore, applyRestore } from '../api/index.js'
+import { saveSettings, testNotify, getSystemInfo, getUpdateInfo, checkUpdate, getUpdateStatus, getUpdateBackups, applyUpdate, rollbackUpdate, saveUpdateConfig, fmtTime, backupExportUrl, previewRestore, applyRestore, authStatus, authSetPassword, setAdminToken } from '../api/index.js'
 
 const state = inject('state')
 const refresh = inject('refresh')
@@ -156,16 +156,23 @@ const backupPreview = ref(null)     // { raw, summary, scope, fileName }
 const backupInput = ref(null)
 
 function exportBackup() {
-  // 走浏览器原生下载：后端以 attachment 响应，文件名由后端给
-  const a = document.createElement('a')
-  a.href = backupExportUrl(backupSecrets.value)
-  a.rel = 'noopener'
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
-  toast(backupSecrets.value
-    ? '已导出完整备份（含登录态，请妥善保管）'
-    : '已导出配置备份（不含登录凭据，可安全分享）')
+  // 开启管理员密码后 <a href> 带不了鉴权头 → api 层改用 fetch blob 下载
+  backupBusy.value = true
+  backupExportUrl(backupSecrets.value).then(({ blob, fileName }) => {
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = fileName
+    a.rel = 'noopener'
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+    toast(backupSecrets.value
+      ? '已导出完整备份（含登录态，请妥善保管）'
+      : '已导出配置备份（不含登录凭据，可安全分享）')
+  }).catch((e) => toast(e.message, 'err'))
+  backupBusy.value = false
 }
 
 async function onPickBackup(e) {
@@ -198,9 +205,38 @@ async function confirmRestore() {
   backupBusy.value = false
 }
 
+// ===== 管理员密码 =====
+// 开启后打开网页要先输密码；连续输错 10 次锁定来源 IP 1 小时（后端 auth.js 实现）
+const authInfo = ref(null)
+const pwdOld = ref('')
+const pwdNew = ref('')
+const pwdNew2 = ref('')
+const authBusy = ref(false)
+
+async function loadAuthInfo() {
+  try { authInfo.value = await authStatus() } catch {}
+}
+
+async function savePassword(enable) {
+  if (enable && pwdNew.value !== pwdNew2.value) { toast('两次输入的新密码不一致', 'err'); return }
+  if (enable && pwdNew.value.length < 6) { toast('密码至少 6 位', 'err'); return }
+  if (!enable && !confirm('确定关闭管理员密码保护？关闭后任何能访问本页的人都可以操作。')) return
+  authBusy.value = true
+  try {
+    const r = await authSetPassword(pwdOld.value, enable ? pwdNew.value : '')
+    if (r.token) setAdminToken(r.token)   // 设置成功后后端会回一个新 session
+    else setAdminToken('')                // 关闭密码：本地登录态一并清掉
+    pwdOld.value = pwdNew.value = pwdNew2.value = ''
+    await loadAuthInfo()
+    toast(r.message || '已保存')
+  } catch (e) { toast(e.message, 'err') }
+  authBusy.value = false
+}
+
 let pollTimer = null
 onMounted(async () => {
   await loadSystemInfo()
+  loadAuthInfo()
   try { updateInfo.value = await getUpdateInfo() } catch {}
 })
 onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
@@ -256,6 +292,37 @@ onUnmounted(() => { if (pollTimer) clearInterval(pollTimer) })
         <button class="btn primary" @click="saveNotify">保存设置</button>
         <button class="btn" :disabled="testing" @click="testPush">{{ testing ? '发送中…' : '发送测试推送' }}</button>
       </div>
+    </div>
+
+    <div class="panel">
+      <h3>管理员密码</h3>
+      <div class="hint" style="margin-bottom:12px">
+        开启后打开本页需要先输入密码，防止同一局域网里的其他人改动签到配置或导出登录态；
+        连续输错 <b>10 次</b> 会锁定来源 IP <b>1 小时</b>。不设置则任何能访问本页的人都可以操作。<br />
+        状态：<span class="tag" :class="authInfo?.enabled ? 'ok' : 'warn'">{{ authInfo?.enabled ? '已开启' : '未开启' }}</span>
+        <template v-if="authInfo?.enabled"> · 登录有效期 {{ authInfo.sessionHours }} 小时（有操作自动续期）</template>
+      </div>
+
+      <template v-if="authInfo?.enabled">
+        <div class="row" style="margin-bottom:12px">
+          <div class="field"><label>当前密码</label><input type="password" v-model="pwdOld" autocomplete="current-password" /></div>
+          <div class="field"><label>新密码（至少 6 位）</label><input type="password" v-model="pwdNew" autocomplete="new-password" /></div>
+          <div class="field"><label>确认新密码</label><input type="password" v-model="pwdNew2" autocomplete="new-password" /></div>
+        </div>
+        <div class="inline">
+          <button class="btn primary" :disabled="authBusy || !pwdOld || !pwdNew" @click="savePassword(true)">修改密码</button>
+          <button class="btn" :disabled="authBusy || !pwdOld" @click="savePassword(false)">关闭密码保护</button>
+        </div>
+      </template>
+      <template v-else>
+        <div class="row" style="margin-bottom:12px">
+          <div class="field"><label>设置管理员密码（至少 6 位）</label><input type="password" v-model="pwdNew" autocomplete="new-password" placeholder="留空表示不启用" /></div>
+          <div class="field"><label>确认密码</label><input type="password" v-model="pwdNew2" autocomplete="new-password" /></div>
+        </div>
+        <div class="inline">
+          <button class="btn primary" :disabled="authBusy || !pwdNew" @click="savePassword(true)">启用密码保护</button>
+        </div>
+      </template>
     </div>
 
     <div class="panel">

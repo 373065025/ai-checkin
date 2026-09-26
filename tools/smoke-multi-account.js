@@ -25,7 +25,10 @@ function findToken() {
     const raw = fs.readFileSync(c, 'utf8');
     try {
       const j = JSON.parse(raw); const a = j.auth || j.data?.auth || j;
-      const t = a.accessToken || a.access_token || j.accessToken;
+      let t = a.accessToken || a.access_token || j.accessToken;
+      // 新版桌面端把 accessToken 加密成 { $wbEncrypted, envelope } 对象，文件里已无明文 JWT → 视为不可用
+      if (t && typeof t !== 'string') t = '';
+      if (t && !/^eyJ[\w-]+\.[\w-]+\.[\w-]+$/.test(t)) t = '';
       if (t) return { token: t, domain: a.domain || 'www.codebuddy.cn', raw };
     } catch {
       const m = raw.match(/eyJ[\w-]+\.[\w-]+\.[\w-]+/);
@@ -103,7 +106,7 @@ try {
   }
   const phone = created.account?.phoneMasked?.replace(/\*/g, '') || '';
   chk(!JSON.stringify(c1.body).includes('1772514257'), '接口没有回显完整手机号');
-  chk(!JSON.stringify(c1.body).includes(String(cred?.token || 'x').slice(0, 40)), '/api/state 未泄露明文 token');
+  chk(!cred || !JSON.stringify(c1.body).includes(String(cred.token).slice(0, 40)), '/api/state 未泄露明文 token');
 
   console.log('\n=== 导入登录态：账号回显 + 重复添加提醒 ===');
   if (cred) {
@@ -120,6 +123,12 @@ try {
   }
   const bad = await post('/api/wb/import', { raw: 'not-a-token' });
   chk(bad.status === 400, '无效登录态被拒绝（400）');
+  // 新版桌面端把 accessToken 加密成对象：必须明确拒绝，而不是当成导入成功但存了空登录态
+  const enc = await post('/api/wb/import', {
+    raw: JSON.stringify({ auth: { accessToken: { $wbEncrypted: 'v1', envelope: 'cGxhY2Vob2xkZXI=' }, domain: 'www.codebuddy.cn' } }),
+  });
+  chk(enc.status === 422 && enc.body.encryptedToken === true, '加密登录态（新版桌面端）被明确拒绝（422）',
+    JSON.stringify(enc.body).slice(0, 120));
 
   console.log('\n=== 按 id 查询实时快照（多账号路由） ===');
   const liveNoId = await get('/api/wb/live?id=__nope__');

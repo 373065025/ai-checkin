@@ -8,6 +8,14 @@ const toast = inject('toast')
 
 const triggerText = { manual: '手动', schedule: '定时', startup: '启动补跑' }
 
+// 定时/补跑失败后的自动重试会记录成 schedule-retry1 这类标记
+function triggerLabel(t) {
+  if (triggerText[t]) return triggerText[t]
+  const m = /^(schedule|startup|manual)-retry(\d+)$/.exec(String(t || ''))
+  if (m) return `${triggerText[m[1]] || m[1]}·重试${m[2]}`
+  return t
+}
+
 async function clear() {
   if (!confirm('确定清空全部日志？')) return
   await clearLogs()
@@ -35,7 +43,7 @@ async function clear() {
           <tr v-for="(l, i) in state.logs" :key="i">
             <td style="color:var(--muted);font-size:12px">{{ l.time || fmtTime(l.ts) }}</td>
             <td>{{ l.providerName }}<div style="font-size:11px;color:var(--muted)">{{ (l.durationMs / 1000).toFixed(1) }}s</div></td>
-            <td><span class="tag">{{ triggerText[l.trigger] || l.trigger }}</span></td>
+            <td><span class="tag">{{ triggerLabel(l.trigger) }}</span></td>
             <td>
               <span class="tag" :class="l.ok ? 'ok' : 'err'">{{ l.ok ? '成功' : '失败' }}</span>
               <div style="margin-top:4px">{{ l.message }}</div>

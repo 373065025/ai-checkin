@@ -86,6 +86,26 @@ export async function fetchRetry(url, options = {}, { retries = 2, timeoutMs = 1
   throw lastErr || new Error('request failed');
 }
 
+/**
+ * 限制并发的 map：结果顺序与输入一致。
+ * 多账号一键签到用它代替串行 for 循环（10 个账号串行要好几十秒）。
+ */
+export async function mapLimit(items, limit, fn) {
+  const list = Array.from(items || []);
+  const out = new Array(list.length);
+  let cursor = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = cursor++;
+      if (i >= list.length) return;
+      out[i] = await fn(list[i], i);
+    }
+  };
+  const n = Math.max(1, Math.min(Number(limit) || 1, list.length || 1));
+  await Promise.all(Array.from({ length: n }, worker));
+  return out;
+}
+
 // 安全取 JSON
 export function tryJson(text) {
   try { return JSON.parse(text); } catch { return null; }

@@ -204,7 +204,13 @@ export async function runWorkBuddy(p) {
       const r = await doCheckin(domain, token);
       steps.push({ action: '每日签到', ok: r.ok, message: r.message });
       notes.push(`签到：${r.ok ? r.message : '失败'}`);
-      if (r.action === 'checked_in') statusData.today_checked_in = true;
+      if (r.action === 'checked_in') {
+        statusData.today_checked_in = true;
+        // 签到接口会回带本次奖励，能拿到就把余额补上，省掉一次额外查询
+        const got = r.data || {};
+        if (Number.isFinite(Number(got.total_credits))) statusData.total_credits = Number(got.total_credits);
+        else if (Number.isFinite(Number(got.credit))) statusData.total_credits = (Number(statusData.total_credits) || 0) + Number(got.credit);
+      }
     } catch (e) {
       steps.push({ action: '每日签到', ok: false, message: e.message });
       notes.push('签到：失败');
@@ -247,10 +253,7 @@ export async function runWorkBuddy(p) {
     notes.join('；') || (statusData.today_checked_in ? '今日已记录' : '今日未记录（完成一次对话即记录）'),
   ].join(' | ');
 
-  return { ok, message: summary, steps, notes, statusData: {
-    total_credits: statusData.total_credits,
-    streak_days: statusData.streak_days,
-    today_checked_in: statusData.today_checked_in,
-    next_streak_day: statusData.next_streak_day,
-  } };
+  // 回传完整状态（含 checkin_dates / today_credit / week_checkin_days）：
+  // 调用方会把它并进实时快照，签到完首屏的「今日积分」「本月打卡天数」才是最新值
+  return { ok, message: summary, steps, notes, statusData };
 }

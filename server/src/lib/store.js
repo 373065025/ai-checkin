@@ -4,7 +4,7 @@ import path from 'node:path';
 import { uid } from './util.js';
 import { AGREEMENT_REVISION } from './agreement.js';
 
-export const VERSION = '1.0.8';
+export const VERSION = '1.0.9';
 const CONFIG_DIR = process.env.CONFIG_DIR || path.join(process.cwd(), 'config_data');
 
 export function configDir() { return CONFIG_DIR; }
@@ -19,6 +19,9 @@ export function defaultSettings() {
     scheduler: { runOnStart: true },
     // 用户协议：安装后首次使用必须同意；记录同意的条款版本，条款修订后会重新提示
     agreement: { revision: '', acceptedAt: 0 },
+    // 管理员密码（可选，默认关闭）。只存 scrypt 哈希，明文永不落盘；
+    // 不进备份、也不被备份覆盖 —— 换机器恢复配置不会把旧密码带过来
+    admin: { enabled: false, salt: '', hash: '', updatedAt: 0 },
     // 应用内自动更新配置（默认走 GitHub Releases；清空 url 即停用自动更新）
     update: {
       url: 'https://github.com/373065025/ai-checkin/releases/latest',
@@ -38,6 +41,8 @@ export function load() {
     settings = JSON.parse(fs.readFileSync(SETTINGS_FILE, 'utf8'));
   } catch { settings = null; }
   settings = { ...defaultSettings(), ...(settings || {}) };
+  // 老配置没有 admin 字段（1.0.9 新增）→ 补默认值，否则鉴权读不到字段会一直要求登录
+  settings.admin = { ...defaultSettings().admin, ...(settings.admin || {}) };
   if (!Array.isArray(settings.providers)) settings.providers = [];
   // 兜底：保证内置 WorkBuddy 任务存在
   if (!settings.providers.some((p) => p.type === 'workbuddy')) {

@@ -1,14 +1,49 @@
-const VERSION = 'v1.0.8'
+const VERSION = 'v1.0.9'
+
+// ===== 管理员登录态 =====
+// 后端开启管理员密码后，所有接口要带 Bearer token；没设密码时后端全放行，这里无感。
+const TOKEN_KEY = 'ai-checkin-admin-token'
+let adminToken = ''
+try { adminToken = localStorage.getItem(TOKEN_KEY) || '' } catch { /* 隐私模式等 */ }
+
+export function getAdminToken() { return adminToken }
+export function hasAdminToken() { return !!adminToken }
+
+export function setAdminToken(t) {
+  adminToken = String(t || '')
+  try {
+    if (adminToken) localStorage.setItem(TOKEN_KEY, adminToken)
+    else localStorage.removeItem(TOKEN_KEY)
+  } catch { /* ignore */ }
+}
+
+// 401 时由 App.vue 注册回调，弹出登录界面
+let unauthorizedHandler = null
+export function onUnauthorized(fn) { unauthorizedHandler = typeof fn === 'function' ? fn : null }
+
+function authHeaders(extra = {}) {
+  const h = { 'Content-Type': 'application/json', ...extra }
+  if (adminToken) h['Authorization'] = `Bearer ${adminToken}`
+  return h
+}
 
 export async function api(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
-    ...options,
-  })
+  const res = await fetch(path, { ...options, headers: authHeaders(options.headers) })
   const data = await res.json().catch(() => ({}))
+  if (res.status === 401 && data.needAuth) {
+    setAdminToken('')
+    unauthorizedHandler?.(data)
+    throw new Error(data.message || '请先登录管理员密码')
+  }
   if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`)
   return data
 }
+
+export const authStatus = () => api('/api/auth/status')
+export const authLogin = (password) => api('/api/auth/login', { method: 'POST', body: JSON.stringify({ password }) })
+export const authLogout = () => api('/api/auth/logout', { method: 'POST', body: '{}' })
+export const authSetPassword = (oldPassword, newPassword) =>
+  api('/api/auth/password', { method: 'POST', body: JSON.stringify({ oldPassword, newPassword }) })
 
 export const getState = () => api('/api/state')
 export const saveSettings = (body) => api('/api/settings', { method: 'POST', body: JSON.stringify(body) })
@@ -45,7 +80,21 @@ export const revokeAgreement = () => api('/api/agreement/revoke', { method: 'POS
 
 // ===== 配置备份与恢复 =====
 // 导出走浏览器原生下载（附件响应），secrets=false 时不带登录凭据，便于分享排查
-export const backupExportUrl = (secrets = true) => `/api/backup/export?secrets=${secrets ? 1 : 0}`
+// 开启管理员密码后 <a href> 带不了鉴权头 → 改为 fetch blob 下载
+export async function backupExportUrl(secrets = true) {
+  const res = await fetch(`/api/backup/export?secrets=${secrets ? 1 : 0}`, { headers: authHeaders() })
+  const data = await res.json().catch(() => ({}))
+  if (res.status === 401 && data.needAuth) {
+    setAdminToken('')
+    unauthorizedHandler?.(data)
+    throw new Error(data.message || '请先登录管理员密码')
+  }
+  if (!res.ok) throw new Error(data.message || `HTTP ${res.status}`)
+  const blob = await res.blob()
+  const dispo = res.headers.get('content-disposition') || ''
+  const m = dispo.match(/filename="?([^";]+)"?/i)
+  return { blob, fileName: m ? m[1] : 'ai-checkin-backup.json' }
+}
 export const previewRestore = (backup) => api('/api/backup/restore', { method: 'POST', body: JSON.stringify({ backup }) })
 export const applyRestore = (backup) => api('/api/backup/restore', { method: 'POST', body: JSON.stringify({ backup, confirm: true }) })
 
